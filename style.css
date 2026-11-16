@@ -73,6 +73,9 @@ button { font-family: inherit; }
 .btn-note { font-size: 0.72rem; font-weight: 500; opacity: 0.85; }
 .btn-row { display: flex; gap: 10px; margin-top: 10px; }
 .btn-row .btn { flex: 1; }
+/* ホーム上部：長い方のボタンを広くして、スマホ幅でも1行に収める */
+.btn-row.hero-row .btn { flex: 0 1 auto; white-space: nowrap; font-size: 0.92rem; padding: 12px 12px; }
+.btn-row.hero-row .btn:first-child { flex: 1 1 auto; }
 .btn-row.center { justify-content: center; }
 .btn-row.center .btn { flex: 0 1 auto; }
 

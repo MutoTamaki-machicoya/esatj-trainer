@@ -831,7 +831,7 @@ function showHome() {
       <div class="hero-badge">都立入試スピーキング対策</div>
       <h1>ESAT-J トレーナー</h1>
       <p class="hero-sub">令和8年度の形式で録音 → その場で<b>自動採点</b>。<br>本試験：<b>2026年11月22日（日）</b></p>
-      <div class="btn-row">
+      <div class="btn-row hero-row">
         <button class="btn ghost" data-act="guide">📖 テストの仕組みと攻略法</button>
         <button class="btn ghost" data-act="settings">⚙️ 設定</button>
       </div>
