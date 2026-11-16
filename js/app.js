@@ -15,7 +15,11 @@ const OFFICIAL_URL = "https://www.kyoiku.metro.tokyo.lg.jp/school/content/global
 
 /* ---------- 設定 ---------- */
 const IS_MOBILE = /iPhone|iPad|Android/i.test(navigator.userAgent);
-const SR_CTOR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
+// Claudeのアーティファクトとして開いているか（window.claude は最初のスクリプトより前に用意される）。
+// アーティファクトでは、対応する capability の無い端末API（getUserMedia / MediaRecorder / SpeechRecognition）は
+// 確認なしで拒否されるので、最初から使わない。話した英語は dictation capability で文字にする
+const IN_ARTIFACT = !!(window.claude && typeof window.claude.use === "function");
+const SR_CTOR = IN_ARTIFACT ? null : (window.SpeechRecognition || window.webkitSpeechRecognition || null);
 
 const Settings = {
   // srOn は自動採点の土台。使えない端末では実行時に自動で落ちる
@@ -145,7 +149,7 @@ const Rec = {
   recorder: null,
   chunks: [],
   mime: "",
-  supported: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder),
+  supported: !IN_ARTIFACT && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder),
   async init() {
     if (!this.supported) return false;
     if (this.stream) return true;
@@ -256,63 +260,24 @@ const AI_NOTE = "文字起こしを元にした目安です。発音は採点し
 
 const AI = {
   sample: null,     // claude.use("sample") の結果
-  dict: null,       // claude.use("dictation") の結果（使えない環境では null）
   blocked: false,   // not_granted など、この画面では二度と出さない
-  dictOff: false,
-  dictTarget: null, // 音声入力の書き込み先 textarea
   allBusy: false,
-  allCtl: null,
   on() { return !!this.sample && !this.blocked; },
   async init() {
+    if (!IN_ARTIFACT) return; // ローカル版・ふつうのブラウザ
     const c = window.claude;
-    if (!c || typeof c.use !== "function") return; // ローカル版・ふつうのブラウザ
     const safe = (name) => { try { return Promise.resolve(c.use(name)).catch(() => null); } catch (e) { return Promise.resolve(null); } };
-    const [s, d] = await Promise.all([safe("sample"), safe("dictation")]);
-    this.sample = s && typeof s.json === "function" ? s : null;
-    this.dict = d && typeof d.start === "function" ? d : null;
-    if (this.dict) this.bindDictation();
-    fillAiSlots();
-  },
-  bindDictation() {
-    const d = this.dict;
-    try {
-      d.onFinal(({ text }) => {
-        const ta = this.dictTarget;
-        if (!ta || !ta.isConnected || !text) return;
-        ta.value += ta.value.trim() ? text : text.replace(/^\s+/, "");
-        ta.dispatchEvent(new Event("input"));
-      });
-      d.onPartial(({ text }) => {
-        const ta = this.dictTarget;
-        const box = ta && ta.isConnected ? ta.closest(".ai-panel") : null;
-        const el = box ? box.querySelector(".ai-partial") : null;
-        if (el) el.textContent = text ? "🎙 " + text : "";
-      });
-      d.onState(({ state, reason }) => {
-        document.querySelectorAll(".ai-dict").forEach((b) => {
-          const mine = this.dictTarget && b.closest(".ai-panel") === this.dictTarget.closest(".ai-panel");
-          b.textContent = state !== "idle" && mine ? "⏹ 音声入力を止める" : "🎙 声で入力";
-          b.classList.toggle("listening", state !== "idle" && mine);
-        });
-        if (state === "idle") {
-          document.querySelectorAll(".ai-partial").forEach((el) => { el.textContent = ""; });
-          if (reason === "not_granted" || reason === "unavailable") this.hideDictation();
-        }
-      });
-    } catch (e) { this.dict = null; }
-  },
-  hideDictation() {
-    this.dictOff = true;
-    document.querySelectorAll(".ai-dict").forEach((b) => b.remove());
-  },
-  stopDictation() {
-    if (this.dict && !this.dictOff) { try { if (this.dict.active()) this.dict.stop().catch(() => {}); } catch (e) {} }
+    const [smp, d] = await Promise.all([safe("sample"), safe("dictation")]);
+    this.sample = smp && typeof smp.json === "function" ? smp : null;
+    if (d && typeof d.start === "function") Dict.bind(d);
+    fillAnswerSlots();
+    refreshEnvNotes();
   },
   // 失敗の種類ごとの対応（ループで再試行しない）
   handleError(e, statusEl) {
     const code = e && e.code ? e.code : "upstream_error";
     const hide = ["not_granted", "sampling_disabled", "not_declared", "capability_disabled", "capability_removed"];
-    if (hide.includes(code)) { this.blocked = true; fillAiSlots(); return; }
+    if (hide.includes(code)) { this.blocked = true; fillAnswerSlots(); return; }
     const msg = {
       cancelled: "採点を止めました。",
       rate_limited: "Claudeの利用が混み合っています。少し待ってから、もう一度押してください。",
@@ -325,6 +290,97 @@ const AI = {
     if (statusEl) statusEl.textContent = msg;
   },
 };
+
+/* ---------- 文字起こし（アーティファクト用：dictation capability） ----------
+   - 生のマイクは使えないので、話した英語は platform の音声入力で受け取る（音そのものは受け取らない）
+   - start() は閲覧者のクリックの中で同期的に呼ぶ必要がある。本番モードは問題の間にクリックが無いので、
+     セッション開始・各Partの「はじめる」・「次へ」のクリックで start() し、セッション中は聞き続ける。
+     使うのは「解答中」に確定した文字だけ（準備中・質問の読み上げ中の文字は捨てる）
+   - 使えない閲覧者（組織外・Safari・スマホのアプリなど）は null → 手入力と自己チェックで振り返る
+   ------------------------------------------------------------------ */
+const Dict = {
+  ns: null,
+  off: false,       // not_granted / unavailable：この画面ではもう出さない
+  state: "idle",
+  route: null,      // "answer"＝解答の文字起こし／textarea＝手入力欄へ
+  buf: "",
+  usable() { return !!this.ns && !this.off; },
+  listening() { return this.usable() && this.state === "listening"; },
+  bind(ns) {
+    this.ns = ns;
+    try {
+      ns.onFinal(({ text }) => {
+        if (!text) return;
+        if (this.route === "answer") { this.buf += text; return; }
+        const ta = this.route;
+        if (ta && ta.isConnected && ta.tagName === "TEXTAREA") {
+          ta.value += ta.value.trim() ? text : text.replace(/^\s+/, "");
+          ta.dispatchEvent(new Event("input"));
+        }
+      });
+      ns.onPartial(({ text }) => {
+        const ta = this.route;
+        const box = ta && ta.isConnected && ta.closest ? ta.closest(".ai-panel") : null;
+        const el = box ? box.querySelector(".ai-partial") : null;
+        if (el) el.textContent = text ? "🎙 " + text : "";
+      });
+      ns.onState(({ state, reason }) => {
+        this.state = state;
+        if (state === "idle") {
+          document.querySelectorAll(".ai-partial").forEach((el) => { el.textContent = ""; });
+          if (reason === "not_granted" || reason === "unavailable") { this.off = true; fillAnswerSlots(); refreshEnvNotes(); }
+          if (this.route && this.route !== "answer") this.route = null;
+        }
+        this.paint();
+      });
+    } catch (e) { this.ns = null; }
+  },
+  // クリックの中から呼ぶ（先に await しない）。聞いていなければ聞き始める
+  ensure() {
+    if (!this.usable()) return;
+    try { if (this.ns.active()) return; } catch (e) { return; }
+    this.ns.start({ language: "en" }).catch((e) => {
+      const c = e && e.code;
+      if (c === "not_granted" || c === "unavailable") { this.off = true; fillAnswerSlots(); refreshEnvNotes(); }
+    });
+  },
+  stop() {
+    this.route = null;
+    if (!this.ns) return;
+    try { if (this.ns.active()) this.ns.stop().catch(() => {}); } catch (e) {}
+  },
+  // 手入力欄の「🎙 声で入力」ボタンの表示
+  paint() {
+    document.querySelectorAll(".ai-dict").forEach((b) => {
+      const ta = b.closest(".ai-panel") && b.closest(".ai-panel").querySelector(".ai-text");
+      const on = this.state !== "idle" && this.route === ta;
+      b.textContent = on ? "⏹ 声で入力をやめる" : "🎙 声で入力";
+      b.classList.toggle("listening", on);
+    });
+    const live = document.getElementById("dict-live");
+    if (live) live.classList.toggle("hidden", !(this.route === "answer" && this.listening()));
+  },
+};
+
+// どの開き方で、何が使えるか（ホームの動作チェック・設定・各Partの説明に出す）
+function envSummary() {
+  return {
+    where: IN_ARTIFACT ? "Claudeのアーティファクト" : "ふつうのWebブラウザ",
+    rec: Rec.supported,
+    text: IN_ARTIFACT ? (Dict.usable() ? "dictation" : null) : (SR_CTOR ? "browser" : null),
+    ai: AI.on(),
+    tts: TTS.available(),
+  };
+}
+function envNoteHtml() {
+  if (!IN_ARTIFACT) return "";
+  return Dict.usable()
+    ? `<div class="warn-banner">この開き方では録音できません。話した英語は音声入力（🎙）で文字にして採点します。</div>`
+    : `<div class="warn-banner">この開き方では録音できません。解答のあとに、お手本・自己チェック・講師の入力で振り返ります。</div>`;
+}
+function refreshEnvNotes() {
+  document.querySelectorAll(".env-note").forEach((el) => { el.innerHTML = envNoteHtml(); });
+}
 
 // 令和8年度 採点基準（都教委公開）の要約。Claudeへの指示に使う
 const AI_RUBRIC = {
@@ -456,17 +512,21 @@ function aiResultHtml(r) {
     </div>`;
 }
 
-// 1問ぶんの Claude 採点パネル（教室の端末でだけ中身が入る）
+// 1問ぶんの「解答の英語」パネル（どの端末でも出す）
+// - 文字起こしを直す／講師が聞き取った英語を打ち込む → 「✅ この英語で自動採点」（ブラウザ内）
+// - 🎙 声で入力（dictation が使える閲覧者だけ）
+// - 🤖 Claudeに採点してもらう（sample が使える教室の端末だけ）
 function aiSlotHtml(qid) {
   return `<div class="ai-slot" data-ai="item" data-qid="${esc(qid)}"></div>`;
 }
 
-function fillAiSlots() {
+function fillAnswerSlots() {
   document.querySelectorAll(".ai-slot").forEach((slot) => {
-    if (!AI.on() || !session) { slot.innerHTML = ""; slot.classList.add("hidden"); return; }
+    const show = !!session && (slot.dataset.ai === "all" ? AI.on() : true);
+    if (!show) { slot.innerHTML = ""; slot.classList.add("hidden"); return; }
     slot.classList.remove("hidden");
     if (slot.dataset.ai === "all") fillAiAll(slot);
-    else fillAiItem(slot);
+    else fillAnswerItem(slot);
   });
 }
 
@@ -479,51 +539,111 @@ function findItem(qid) {
   return null;
 }
 
-function fillAiItem(slot) {
+/* ---------- 自己チェック（自動採点できなかった問題） ---------- */
+function selfChecksOf(it, data) {
+  if (it.part === "C") {
+    return [`画面の書き出し「${data.opener}」から始めた`]
+      .concat(data.points.map((p, i) => `ポイント${i + 1}：${p}`))
+      .concat(["つなぎ語（Then / So / After that）と過去形を使った"]);
+  }
+  if (it.part === "D") {
+    return ["① 意見をはっきり言えた（I think 〜.）", "② 理由を言えた（First, 〜. / Because 〜.）", "③ 具体例を言えた（For example, 〜.）", "④ まとめた（So, I think 〜.）"];
+  }
+  return CHECKS[it.part];
+}
+
+function selfCheckHtml(it, data, ans) {
+  if (ans && ans.score) return "";
+  const done = (ans && ans.self) || {};
+  return `
+    <div class="checks" data-qid="${esc(data.id)}">
+      <div class="model-title">✔ 自己チェック（録音・お手本と比べて、できたことに印）</div>
+      ${selfChecksOf(it, data).map((c, ci) => `
+        <label class="check-row"><input type="checkbox" class="self-check" data-qid="${esc(data.id)}" data-ci="${ci}" ${done[ci] ? "checked" : ""}><span>${esc(c)}</span></label>`).join("")}
+    </div>`;
+}
+
+// 自己チェックの印を解答に記録する（画面をまたいで最終画面に引きつぐ）
+function bindSelfChecks(root, onChange) {
+  root.querySelectorAll(".self-check").forEach((b) => {
+    b.onchange = () => {
+      const ans = session && session.answers[b.dataset.qid];
+      if (ans) { ans.self = ans.self || {}; ans.self[b.dataset.ci] = b.checked; }
+      if (onChange) onChange();
+    };
+  });
+}
+
+// 手入力・音声入力で直した英語で、ブラウザ内の自動採点をやり直す
+function rescoreAnswer(it, data) {
+  const ans = session.answers[data.id] || (session.answers[data.id] = {});
+  const text = answerTextOf(ans);
+  ans.score = scoreAnswer(it.part, { qid: data.id, setId: session.set.id, prev: prevAnswerText(it) }, data.text, text);
+  refreshScoreViews(it, data);
+}
+
+function refreshScoreViews(it, data) {
+  const ans = session.answers[data.id] || {};
+  document.querySelectorAll(`.score-area[data-qid="${data.id}"]`).forEach((el) => {
+    el.innerHTML = scoreCardHtml(ans) + (el.dataset.self === "1" ? selfCheckHtml(it, data, ans) : "");
+    bindSelfChecks(el, () => updateFinalGrade());
+  });
+  document.querySelectorAll(`.self-area[data-qid="${data.id}"]`).forEach((el) => {
+    el.innerHTML = selfCheckHtml(it, data, ans);
+    bindSelfChecks(el, () => updateFinalGrade());
+  });
+  document.querySelectorAll(`.row-grade[data-qid="${data.id}"]`).forEach((el) => {
+    el.innerHTML = ans.score ? `<span class="hist-grade g-${ans.score.grade}">${ans.score.grade}</span>` : "";
+  });
+  renderFinalTable();
+  renderFinalResult();
+}
+
+function fillAnswerItem(slot) {
   const qid = slot.dataset.qid;
   const found = findItem(qid);
   if (!found) return;
   const { it, data } = found;
   const ans = session.answers[qid] || (session.answers[qid] = {});
   const val = typeof ans.manual === "string" ? ans.manual : (ans.transcript || "");
-  const showDict = AI.dict && !AI.dictOff;
+  const showDict = Dict.usable();
+  const ai = AI.on();
   slot.innerHTML = `
     <div class="ai-panel">
-      <div class="ai-panel-title">🤖 Claude採点（教室の端末用）</div>
-      <label class="ai-label">採点に使う解答（文字起こし。聞き取れていないときは講師が聞いた英語を入力）</label>
+      <div class="ai-panel-title">✍️ 解答の英語${ai ? "（🤖 Claude採点つき）" : ""}</div>
+      <label class="ai-label">文字起こしを直す・聞き取れなかったときは講師が聞いた英語を入力${showDict ? "（🎙 で声でも入力できます）" : ""}</label>
       <textarea class="ai-text" rows="3" placeholder="例）It starts at one p.m.">${esc(val)}</textarea>
       <div class="ai-partial"></div>
       <div class="btn-row ai-btns">
         ${showDict ? '<button class="btn tiny ghost ai-dict" type="button">🎙 声で入力</button>' : ""}
-        <button class="btn secondary ai-go" type="button">🤖 Claudeに採点してもらう</button>
+        <button class="btn tiny ghost ans-rescore" type="button">✅ この英語で自動採点</button>
+        ${ai ? '<button class="btn secondary ai-go" type="button">🤖 Claudeに採点してもらう</button>' : ""}
       </div>
       <div class="ai-status muted small"></div>
-      <div class="ai-out">${aiResultHtml(ans.ai)}</div>
-      <p class="ai-note">※ ${AI_NOTE}</p>
+      ${ai ? `<div class="ai-out">${aiResultHtml(ans.ai)}</div><p class="ai-note">※ ${AI_NOTE}</p>` : ""}
     </div>`;
   const ta = slot.querySelector(".ai-text");
   const status = slot.querySelector(".ai-status");
-  const out = slot.querySelector(".ai-out");
-  const go = slot.querySelector(".ai-go");
   ta.addEventListener("input", () => { ans.manual = ta.value; });
+  slot.querySelector(".ans-rescore").onclick = () => {
+    ans.manual = ta.value;
+    rescoreAnswer(it, data);
+    status.textContent = ans.score ? "自動採点しました。" : "英語が入っていないので採点できません。";
+  };
   const dictBtn = slot.querySelector(".ai-dict");
   if (dictBtn) {
     dictBtn.onclick = () => {
-      // start() はクリックの中で同期的に呼ぶ（先に await しない）
-      try {
-        if (AI.dict.active()) { AI.dict.stop().catch(() => {}); return; }
-      } catch (e) {}
-      AI.dictTarget = ta;
-      status.textContent = "英語で話してください（もう一度押すと止まります）";
-      AI.dict.start({ language: "en" }).catch((e) => {
-        const c = e && e.code;
-        if (c === "not_granted" || c === "unavailable") { AI.hideDictation(); status.textContent = "この端末では音声入力が使えません。キーボードで入力してください。"; }
-        else if (c === "dismissed" || c === "stopped") status.textContent = "";
-        else status.textContent = "音声入力を始められませんでした。キーボードで入力してください。";
-      });
+      // dictation の start() はクリックの中で同期的に呼ぶ（Dict.ensure の中で呼ぶ）
+      if (Dict.route === ta) { Dict.route = null; Dict.paint(); status.textContent = ""; return; }
+      Dict.route = ta;
+      Dict.ensure();
+      Dict.paint();
+      status.textContent = "英語で話してください（もう一度押すとやめます）";
     };
   }
-  bindSayButtons(out);
+  const go = slot.querySelector(".ai-go");
+  if (!go) return;
+  bindSayButtons(slot.querySelector(".ai-out"));
   if (ans.aiBusy) { go.disabled = true; status.textContent = "🤖 Claudeが採点しています…"; }
   go.onclick = async () => {
     if (ans.aiBusy) return;
@@ -538,7 +658,7 @@ function fillAiItem(slot) {
       ans.ai = normAi(raw);
       // 画面を移動していても結果は記録しておく（最終画面の表に出る）
       const live = document.querySelector(`.ai-slot[data-ai="item"][data-qid="${qid}"]`);
-      if (live) {
+      if (live && live.querySelector(".ai-out")) {
         live.querySelector(".ai-out").innerHTML = aiResultHtml(ans.ai);
         live.querySelector(".ai-status").textContent = "";
         bindSayButtons(live.querySelector(".ai-out"));
@@ -588,7 +708,7 @@ function fillAiAll(slot) {
         if (id && sess.answers[id]) sess.answers[id].ai = normAi(x);
       });
       sess.aiAll = { parts: parts, summary: typeof o.summary === "string" ? o.summary.trim() : "" };
-      if (session === sess) { fillAiSlots(); renderFinalTable(); }
+      if (session === sess) { fillAnswerSlots(); renderFinalTable(); }
     } catch (e) {
       AI.handleError(e, document.querySelector('.ai-slot[data-ai="all"] .ai-status'));
     } finally {
@@ -602,7 +722,8 @@ function fillAiAll(slot) {
 /* ---------- アプリ状態 ---------- */
 let session = null; // { set, mode, parts, items, cur, answers, micOK }
 let flowId = 0;     // 画面遷移ごとに増やし、古い非同期コールバックを無効化する
-const bump = () => { AI.stopDictation(); return ++flowId; };
+// 画面が変わったら、手入力欄への音声入力だけ切る（解答の文字起こしは finish() が片づける）
+const bump = () => { if (Dict.route && Dict.route !== "answer") Dict.route = null; return ++flowId; };
 const alive = (id) => id === flowId;
 
 // window.confirm はサンドボックス内(iframe埋め込み等)で無効化されることがあるため自前モーダルを使う
@@ -688,6 +809,7 @@ function showHome() {
   Timer.stop();
   TTS.stop();
   Rec.release();
+  Dict.stop();
   session = null;
   document.body.classList.remove("in-session");
 
@@ -713,7 +835,7 @@ function showHome() {
         <button class="btn ghost" data-act="guide">📖 テストの仕組みと攻略法</button>
         <button class="btn ghost" data-act="settings">⚙️ 設定</button>
       </div>
-      <button class="btn tiny ghost mic-test" data-act="mictest">🎤 マイクと採点が使えるか調べる</button>
+      <button class="btn tiny ghost mic-test" data-act="mictest">🎤 動作チェック（マイク・文字起こし・採点）</button>
       <div id="mictest-result"></div>
     </div>
 
@@ -761,24 +883,60 @@ async function runMicTest(btn) {
   Beep.init();
   const line = (ok, label, note) => `<div class="test-row ${ok ? "yes" : "no"}"><span class="mk">${ok ? "◎" : "✕"}</span><span><b>${esc(label)}</b><small>${esc(note)}</small></span></div>`;
   const aiLine = AI.on() ? line(true, "Claude採点", "この端末で使えます（振り返り画面と最終画面にボタンが出ます）") : "";
+  const ttsLine = line(TTS.available(), "質問の読み上げ", TTS.available() ? "使えます" : "英語の音声が見つかりません（質問は文字で出します）");
+  const where = `<p class="env-where">開き方：<b>${IN_ARTIFACT ? "Claudeのアーティファクト" : "ふつうのWebブラウザ"}</b></p>`;
+
+  if (IN_ARTIFACT) {
+    // アーティファクトでは生のマイク（録音・ブラウザの音声認識）は使えない。文字起こしは dictation で試す
+    const noAi = AI.on() ? "" : line(false, "Claude採点", "この閲覧者では使えません（塾のClaudeアカウントでログインした教室の端末で使えます）");
+    if (!Dict.usable()) {
+      box.innerHTML = `<div class="card test-card">${where}
+        ${line(false, "録音", "この開き方では録音できません")}
+        ${line(false, "文字起こし（音声入力）", "この閲覧者・ブラウザでは使えません")}
+        ${line(false, "自動採点", "文字起こしが無いので、講師が英語を入力したときだけ採点します")}
+        ${aiLine}${noAi}${ttsLine}
+        <p class="muted small">タイマー・お手本・自己チェック・講師の入力欄で練習できます。</p></div>`;
+      btn.disabled = false;
+      return;
+    }
+    btn.disabled = true;
+    Dict.buf = "";
+    Dict.route = "answer";
+    Dict.ensure(); // クリックの中で始める
+    box.innerHTML = `<div class="card test-card"><p class="test-say">英語で話しかけてください<br><b>"Hello, my name is ○○."</b></p><p class="rec-note"><span class="rec-dot"></span> 音声入力で聞き取り中… 6秒</p></div>`;
+    await new Promise((r) => setTimeout(r, 6000));
+    await new Promise((r) => setTimeout(r, 1500));
+    const heard = Dict.buf.trim();
+    Dict.stop();
+    Dict.buf = "";
+    box.innerHTML = `<div class="card test-card">${where}
+      ${line(false, "録音", "この開き方では録音できません（聞き直しはできません）")}
+      ${line(!!heard, "文字起こし（音声入力）", heard ? "声を英語として文字にできました" : (Dict.usable() ? "文字になりませんでした（許可・マイク・声の大きさを確認）" : "この閲覧者では使えません"))}
+      ${line(!!heard, "自動採点", heard ? "文字起こしで採点できます" : "講師が英語を入力したときだけ採点します")}
+      ${aiLine}${noAi}${ttsLine}
+      ${heard ? `<p class="transcript">📝 聞き取り結果：<br>"${esc(heard)}"</p>` : ""}
+      <button class="btn tiny ghost" data-act="mictest">もう一度ためす</button></div>`;
+    btn.disabled = false;
+    return;
+  }
 
   box.innerHTML = `<div class="card test-card"><p>マイクを準備しています…<br><small class="muted">「許可」を押してください</small></p></div>`;
   const micOK = await Rec.init();
   if (!micOK) {
-    box.innerHTML = `<div class="card test-card">
+    box.innerHTML = `<div class="card test-card">${where}
       ${line(false, "録音", Rec.supported ? "マイクが使えません。ブラウザのマイク許可を確認してください" : "このブラウザは録音に対応していません")}
       ${line(false, "自動採点", "マイクが使えないため採点もできません")}
-      ${aiLine}
+      ${line(false, "Claude採点", "アーティファクトで開いたときだけ使えます")}${ttsLine}
       <p class="muted small">Chromeで開き直すと解決することが多いです。録音なしでもタイマー練習はできます。</p></div>`;
     btn.disabled = false;
     return;
   }
 
   if (!SR_CTOR || !Settings.data.srOn) {
-    box.innerHTML = `<div class="card test-card">
+    box.innerHTML = `<div class="card test-card">${where}
       ${line(true, "録音", "使えます")}
       ${line(false, "自動採点", SR_CTOR ? "設定でオフになっています" : "このブラウザは音声認識に未対応です（Chrome推奨）")}
-      ${aiLine}
+      ${line(false, "Claude採点", "アーティファクトで開いたときだけ使えます")}${ttsLine}
       <p class="muted small">録音の聞き直しと解答例での自己チェックは使えます。</p></div>`;
     Rec.release();
     btn.disabled = false;
@@ -797,10 +955,10 @@ async function runMicTest(btn) {
   const heard = SR.text.trim();
   Rec.release();
 
-  box.innerHTML = `<div class="card test-card">
+  box.innerHTML = `<div class="card test-card">${where}
     ${line(true, "録音", "使えます")}
-    ${line(!!heard, "自動採点", heard ? "声を英語として聞き取れました" : (SR.failed ? "音声認識がブロックされました" : "声を拾えませんでした"))}
-    ${aiLine}
+    ${line(!!heard, "文字起こし・自動採点（ブラウザの音声認識）", heard ? "声を英語として聞き取れました" : (SR.failed ? "音声認識がブロックされました" : "声を拾えませんでした"))}
+    ${line(false, "Claude採点", "アーティファクトで開いたときだけ使えます")}${ttsLine}
     ${heard ? `<p class="transcript">📝 聞き取り結果：<br>"${esc(heard)}"</p>` : '<p class="muted small">マイクに近づく／静かな場所で／英語で話す、を試してください。それでもダメなら録音だけで練習できます。</p>'}
     <button class="btn tiny ghost" data-act="mictest">もう一度ためす</button></div>`;
   btn.disabled = false;
@@ -903,9 +1061,10 @@ function showSettings() {
           <option value="1.1" ${s.rate === 1.1 ? "selected" : ""}>はやい</option>
         </select>
       </label>
-      <p class="muted">音声の読み上げ：${TTS.available() ? "✅ 利用できます" : "⚠️ このブラウザでは英語音声が見つかりません（質問は文字で表示されます）"}<br>
-      録音機能：${Rec.supported ? "✅ 利用できます（開始時にマイク許可が必要）" : "⚠️ このブラウザでは録音できません（タイマー練習のみ）"}<br>
-      自動採点：${SR_CTOR ? "✅ 利用できます" : "⚠️ このブラウザでは利用できません（Chrome推奨）"}<br>
+      <p class="muted">開き方：<b>${IN_ARTIFACT ? "Claudeのアーティファクト（録音・ブラウザの音声認識は使えません。文字起こしは音声入力🎙）" : "ふつうのWebブラウザ"}</b><br>
+      音声の読み上げ：${TTS.available() ? "✅ 利用できます" : "⚠️ このブラウザでは英語音声が見つかりません（質問は文字で表示されます）"}<br>
+      録音機能：${Rec.supported ? "✅ 利用できます（開始時にマイク許可が必要）" : IN_ARTIFACT ? "— この開き方では録音できません" : "⚠️ このブラウザでは録音できません（タイマー練習のみ）"}<br>
+      文字起こし：${IN_ARTIFACT ? (Dict.usable() ? "✅ 音声入力（🎙）で文字にします" : "— この閲覧者では使えません（講師の手入力と自己チェック）") : (SR_CTOR ? "✅ ブラウザの音声認識（Chrome）" : "⚠️ このブラウザでは利用できません（Chrome推奨）")}<br>
       Claude採点：${AI.on() ? "✅ この端末で使えます（教室用）" : "— この画面では使えません（塾のClaudeアカウントでログインした教室の端末で使えます）"}</p>
       <p class="muted small">録音ファイルと採点結果は端末の中だけに保存されます。聞き取り自体はブラウザの音声認識機能を使うため、Chromeでは音声がGoogleの認識サービスで処理されます。Claude採点は、ボタンを押したときだけ問題文と文字起こし（録音そのものや名前は送りません）をClaudeに送ります。</p>
     </div>
@@ -931,6 +1090,7 @@ function showSettings() {
 async function startSession(setId, mode, parts) {
   const set = SETS.find((s) => s.id === setId);
   if (!set) return;
+  Dict.ensure(); // アーティファクト：クリックの中で音声入力を始める（使えない閲覧者では何もしない）
   Beep.init();
   TTS.warm();
   SR.failed = false;
@@ -946,7 +1106,8 @@ async function startSession(setId, mode, parts) {
 
   const id = bump();
   $app().innerHTML = `<div class="card center-card"><p class="big-icon">🎤</p><p>マイクの準備をしています…<br><small class="muted">「マイクの使用を許可」を押してください</small></p></div>`;
-  session.micOK = await Rec.init();
+  // アーティファクトでは生のマイクを要求しない（確認なしで拒否されるため）
+  session.micOK = IN_ARTIFACT ? false : await Rec.init();
   if (!alive(id)) return;
   showPartIntro();
 }
@@ -983,9 +1144,11 @@ function showPartIntro() {
   TTS.stop();
   const it = session.items[session.cur];
   const m = partOf(it);
-  const micNote = session.micOK === false
-    ? `<div class="warn-banner">🎤 マイクが使えないため<b>録音なし（タイマーのみ）</b>で練習します。${Rec.supported ? "ブラウザのマイク許可を確認してください。" : ""}</div>`
-    : "";
+  const micNote = IN_ARTIFACT
+    ? `<div class="env-note">${envNoteHtml()}</div>`
+    : session.micOK === false
+      ? `<div class="warn-banner">🎤 マイクが使えないため<b>録音なし（タイマーのみ）</b>で練習します。${Rec.supported ? "ブラウザのマイク許可を確認してください。" : ""}</div>`
+      : "";
 
   $app().innerHTML = `
     ${sessionHeader()}
@@ -1000,7 +1163,7 @@ function showPartIntro() {
     <button class="btn primary wide" data-act="go">はじめる</button>
   `;
   bindQuit($app());
-  $app().querySelector("button[data-act='go']").onclick = () => { Beep.init(); TTS.warm(); showQuestion(); };
+  $app().querySelector("button[data-act='go']").onclick = () => { Dict.ensure(); Beep.init(); TTS.warm(); showQuestion(); };
   window.scrollTo(0, 0);
 }
 
@@ -1130,9 +1293,16 @@ function showQuestion() {
     let recording = false;
     if (session.micOK) recording = Rec.start();
     SR.start();
+    // アーティファクト：解答中に確定した文字だけを集める
+    const useDict = IN_ARTIFACT && Dict.usable();
+    if (useDict) { Dict.buf = ""; Dict.route = "answer"; }
     const t0 = performance.now();
     const note = document.getElementById("rec-note");
-    if (note) note.innerHTML = recording ? '<span class="rec-dot"></span> 録音中… マイクに向かって話そう' : "🎤 録音なし（声に出して話そう）";
+    if (note) {
+      note.innerHTML = recording ? '<span class="rec-dot"></span> 録音中… マイクに向かって話そう'
+        : useDict ? (Dict.listening() ? '<span class="rec-dot"></span> 🎙 文字にしています… 英語で話そう' : "🎙 音声入力が止まっています（声に出して話そう。次の「はじめる」「次へ」で再開）")
+        : IN_ARTIFACT ? "この開き方では録音できません（声に出して話そう）" : "🎤 録音なし（声に出して話そう）";
+    }
     setPhase("かいとう！", "answering");
     btnStop.classList.remove("hidden");
 
@@ -1145,9 +1315,15 @@ function showQuestion() {
       SR.stop();
       const secs = Math.min(T.ans, Math.round((performance.now() - t0) / 1000));
       const rec = await Rec.stop();
-      await new Promise((r) => setTimeout(r, 400)); // 文字起こしの遅延分待つ
+      // 文字起こしの遅れ分待つ（音声入力は確定まで少し長め）
+      await new Promise((r) => setTimeout(r, useDict ? 1500 : 400));
+      let transcript = SR.text.trim();
+      if (useDict) {
+        if (Dict.route === "answer") Dict.route = null;
+        transcript = Dict.buf.trim();
+        Dict.buf = "";
+      }
       if (!alive(fid)) return;
-      const transcript = SR.text.trim();
       session.answers[data.id] = {
         url: rec ? rec.url : null,
         mime: rec ? rec.mime : null,
@@ -1306,16 +1482,21 @@ function scoreCardHtml(ans) {
         <p class="score-advice">💬 ${esc(s.advice)}</p>
       </div>`;
   }
-  // 音声認識が使えなかったとき
-  const why = !SR_CTOR
-    ? "このブラウザは音声認識に対応していません（Chrome推奨）。"
-    : !Settings.data.srOn
-      ? "設定で自動採点をオフにしています。"
-      : "声が拾えませんでした。マイクの許可と、静かな場所かどうかを確認してください。";
-  return `<div class="score-box none"><b>自動採点できませんでした</b><small>${esc(why)}</small><small>録音を聞き直して、下の解答例と比べてみましょう。</small></div>`;
+  // 文字起こしが取れなかったとき
+  const why = IN_ARTIFACT
+    ? (Dict.usable()
+      ? "声が文字になりませんでした（音声入力が止まっていた／小さな声 など）。"
+      : "この開き方では録音・音声の文字起こしができません。")
+    : !SR_CTOR
+      ? "このブラウザは音声認識に対応していません（Chrome推奨）。"
+      : !Settings.data.srOn
+        ? "設定で自動採点をオフにしています。"
+        : "声が拾えませんでした。マイクの許可と、静かな場所かどうかを確認してください。";
+  return `<div class="score-box none"><b>自動採点できませんでした</b><small>${esc(why)}</small><small>下の欄に英語を入れて「✅ この英語で自動採点」を押すか、解答例と比べて自己チェックしましょう。</small></div>`;
 }
 
 function bindSayButtons(root) {
+  if (!root) return;
   root.querySelectorAll("button[data-say]").forEach((b) => {
     if (!TTS.available()) { b.style.display = "none"; return; }
     b.onclick = () => TTS.speak(b.dataset.say, {});
@@ -1334,9 +1515,9 @@ function showReviewOne() {
     <div class="q-label">${esc(itemLabel(it))} の振り返り</div>
     <div class="card review-card" style="--c:${m.color}">
       <div class="model-title">あなたの解答</div>
-      ${ans.url ? `<audio controls src="${ans.url}" class="player"></audio>` : '<p class="muted">（録音なし）</p>'}
+      ${ans.url ? `<audio controls src="${ans.url}" class="player"></audio>` : `<p class="muted">（録音なし${IN_ARTIFACT ? "：この開き方では録音できません" : ""}）</p>`}
       ${ans.transcript ? `<p class="transcript">📝 聞き取った内容：<br>"${esc(ans.transcript)}"</p>` : ""}
-      ${scoreCardHtml(ans)}
+      <div class="score-area" data-qid="${esc(data.id)}" data-self="1">${scoreCardHtml(ans)}${selfCheckHtml(it, data, ans)}</div>
       ${aiSlotHtml(data.id)}
       ${modelHtml(it, data)}
     </div>
@@ -1347,9 +1528,11 @@ function showReviewOne() {
   `;
   bindQuit($app());
   bindSayButtons($app());
-  fillAiSlots();
-  $app().querySelector("button[data-act='retry']").onclick = () => showQuestion();
-  $app().querySelector("button[data-act='next']").onclick = () => { TTS.stop(); nextItem(); };
+  bindSelfChecks($app());
+  fillAnswerSlots();
+  // 「次へ」「もう一度」はクリックなので、止まっていた音声入力をここで再開できる
+  $app().querySelector("button[data-act='retry']").onclick = () => { Dict.ensure(); showQuestion(); };
+  $app().querySelector("button[data-act='next']").onclick = () => { Dict.ensure(); TTS.stop(); nextItem(); };
   window.scrollTo(0, 0);
 }
 
@@ -1374,7 +1557,12 @@ function finalTableHtml() {
   if (!session) return "";
   const aiParts = (session.aiAll && session.aiAll.parts) || {};
   const anyAi = AI.on() || session.items.some((it) => (session.answers[itemData(it, session.set).id] || {}).ai);
-  const cell = (s) => (s ? `<span class="hist-grade g-${s.grade}">${s.grade}</span> <small class="pct">${s.percent}%</small>` : '<span class="muted">—</span>');
+  const cell = (s, ans, it) => {
+    if (s) return `<span class="hist-grade g-${s.grade}">${s.grade}</span> <small class="pct">${s.percent}%</small>`;
+    const n = selfChecksOf(it, itemData(it, session.set)).length;
+    const k = ans && ans.self ? Object.values(ans.self).filter(Boolean).length : 0;
+    return k ? `<small>自己✔ ${k}/${n}</small>` : '<span class="muted">—</span>';
+  };
   const aiCell = (r) => (r ? `<span class="ai-level sm ${lvClass(r.level)}">${esc(r.level)}</span>` : '<span class="muted">—</span>');
   const rows = [];
   ["A", "B", "C", "D"].forEach((p) => {
@@ -1383,7 +1571,7 @@ function finalTableHtml() {
     its.forEach((it) => {
       const ans = session.answers[itemData(it, session.set).id] || {};
       const n = ans.score && ans.score.words != null ? ans.score.words : (answerTextOf(ans) ? answerTextOf(ans).split(/\s+/).length : 0);
-      rows.push(`<tr><td class="lbl">${esc(itemLabel(it).replace("Part ", ""))}</td><td>${cell(ans.score)}</td>${anyAi ? `<td>${aiCell(ans.ai)}</td>` : ""}<td class="num">${ans.secs != null ? ans.secs + "秒" : "—"}</td><td class="num">${n}語</td></tr>`);
+      rows.push(`<tr><td class="lbl">${esc(itemLabel(it).replace("Part ", ""))}</td><td>${cell(ans.score, ans, it)}</td>${anyAi ? `<td>${aiCell(ans.ai)}</td>` : ""}<td class="num">${ans.secs != null ? ans.secs + "秒" : "—"}</td><td class="num">${n}語</td></tr>`);
     });
     const ss = its.map((it) => (session.answers[itemData(it, session.set).id] || {}).score).filter(Boolean);
     const avg = ss.length ? Math.round(ss.reduce((s, x) => s + x.ratio, 0) / ss.length * 100) : null;
@@ -1396,7 +1584,7 @@ function finalTableHtml() {
         <tr><th>問題</th><th>自動採点</th>${anyAi ? "<th>Claude</th>" : ""}<th>時間</th><th>語数</th></tr>
         ${rows.join("")}
       </table>
-      <p class="muted small">自動採点＝ブラウザ内の目安（A〜F）。${anyAi ? "Claude＝令和8年度採点基準のレベル（目安）。" : ""}時間＝話していた秒数。</p>
+      <p class="muted small">自動採点＝ブラウザ内の目安（A〜F。採点できなかった問題は自己チェックの数）。${anyAi ? "Claude＝令和8年度採点基準のレベル（目安）。" : ""}時間＝話していた秒数。</p>
     </div>`;
 }
 
@@ -1405,14 +1593,12 @@ function renderFinalTable() {
   if (box) box.innerHTML = finalTableHtml();
 }
 
-function showFinal() {
-  bump();
-  Timer.stop();
-  TTS.stop();
-  Rec.release();
+function finalOverall() {
+  return overallScore(session.items.map((it) => (session.answers[itemData(it, session.set).id] || {}).score));
+}
 
-  const overall = overallScore(session.items.map((it) => (session.answers[itemData(it, session.set).id] || {}).score));
-
+function finalResultHtml() {
+  const overall = finalOverall();
   // パートごとの達成率（自動採点できた問題だけで平均）
   const byPart = ["A", "B", "C", "D"].map((p) => {
     const ss = session.items.filter((it) => it.part === p)
@@ -1421,9 +1607,8 @@ function showFinal() {
     const r = ss.reduce((s, x) => s + x.ratio, 0) / ss.length;
     return { part: p, ratio: r, percent: Math.round(r * 100), meta: PART_META[p] };
   }).filter(Boolean);
-
-  const resultCard = overall
-    ? `
+  if (overall) {
+    return `
       <div class="card result-card lv-${overall.grade}">
         <div class="result-head">
           <div class="result-grade g-${overall.grade}">${overall.grade}</div>
@@ -1439,34 +1624,64 @@ function showFinal() {
             <span class="bar-track"><span class="bar-fill" style="width:${b.percent}%;background:${b.meta.color}"></span></span>
             <span class="bar-num">${b.percent}%</span>
           </div>`).join("")}</div>` : ""}
-        <p class="muted small">※ 話した内容を音声認識で判定した目安です。発音の良し悪しは判定していません。実際のESAT-Jの採点とは異なります。</p>
-      </div>`
-    : `
-      <div class="card grade-card">
-        <h2>振り返り</h2>
-        <p class="muted">自動採点ができなかったので、録音を聞き直して、できたことに ✔ を入れよう。</p>
-        <div class="grade-line">自己チェック達成率 <b id="rate-num">0%</b> → 評価の目安 <span class="hist-grade big" id="grade-est">–</span></div>
+        <p class="muted small">※ 話した内容の文字起こしで判定した目安です。発音の良し悪しは判定していません。実際のESAT-Jの採点とは異なります。</p>
       </div>`;
+  }
+  return `
+    <div class="card grade-card">
+      <h2>振り返り</h2>
+      <p class="muted">自動採点ができなかったので、${IN_ARTIFACT ? "" : "録音を聞き直し、"}解答例と比べて、できたことに ✔ を入れよう（講師が英語を入力して「✅ この英語で自動採点」を押してもOK）。</p>
+      <div class="grade-line">自己チェック達成率 <b id="rate-num">0%</b> → 評価の目安 <span class="hist-grade big" id="grade-est">–</span></div>
+    </div>`;
+}
 
-  const rows = session.items.map((it, i) => {
+function renderFinalResult() {
+  const box = document.getElementById("final-result");
+  if (!box) return;
+  box.innerHTML = finalResultHtml();
+  updateFinalGrade();
+}
+
+// 自動採点が1問も無いときは、自己チェックの割合で評価の目安を出す
+function updateFinalGrade() {
+  if (!session || !document.getElementById("final-result")) return null;
+  const overall = finalOverall();
+  if (overall) return { rate: overall.ratio, grade: overall.grade, auto: true };
+  const boxes = Array.from($app().querySelectorAll(".self-check"));
+  const rate = boxes.length ? boxes.filter((b) => b.checked).length / boxes.length : 0;
+  const g = GRADE_TABLE.find((x) => rate >= x.min) || GRADE_TABLE[GRADE_TABLE.length - 1];
+  const num = document.getElementById("rate-num");
+  const est = document.getElementById("grade-est");
+  if (num) num.textContent = Math.round(rate * 100) + "%";
+  if (est) { est.textContent = g.grade; est.className = "hist-grade big g-" + g.grade; }
+  renderFinalTable();
+  return { rate, grade: g.grade, auto: false };
+}
+
+function showFinal() {
+  bump();
+  Timer.stop();
+  TTS.stop();
+  Rec.release();
+  Dict.stop(); // 練習が終わったら音声入力も止める
+
+  const rows = session.items.map((it) => {
     const data = itemData(it, session.set);
     const ans = session.answers[data.id] || {};
     const m = partOf(it);
-    const checks = ans.score ? "" : CHECKS[it.part].map((c, ci) => `
-      <label class="check-row"><input type="checkbox" class="self-check" data-i="${i}" data-ci="${ci}"><span>${esc(c)}</span></label>`).join("");
     return `
       <div class="card review-card" style="--c:${m.color}">
         <div class="q-head">
           <span class="q-label small">${esc(itemLabel(it))}</span>
-          ${ans.score ? `<span class="hist-grade g-${ans.score.grade}">${ans.score.grade}</span>` : ""}
+          <span class="row-grade" data-qid="${esc(data.id)}">${ans.score ? `<span class="hist-grade g-${ans.score.grade}">${ans.score.grade}</span>` : ""}</span>
         </div>
         ${ans.url ? `
           <audio controls src="${ans.url}" class="player"></audio>
           <a class="dl-link" href="${ans.url}" download="ESATJ_${esc(session.set.title)}_${esc(itemLabel(it)).replace(/[\s.]/g, "")}.${extOf(ans.mime)}">⬇️ 録音を保存</a>` : '<p class="muted">（録音なし）</p>'}
         ${ans.transcript ? `<p class="transcript">📝 "${esc(ans.transcript)}"</p>` : ""}
         ${aiSlotHtml(data.id)}
-        <details class="model-details"><summary>採点の内訳と解答例を見る</summary>${scoreCardHtml(ans)}${modelHtml(it, data)}</details>
-        ${checks ? `<div class="checks">${checks}</div>` : ""}
+        <details class="model-details"><summary>採点の内訳と解答例を見る</summary><div class="score-area" data-qid="${esc(data.id)}">${scoreCardHtml(ans)}</div>${modelHtml(it, data)}</details>
+        <div class="self-area" data-qid="${esc(data.id)}">${selfCheckHtml(it, data, ans)}</div>
       </div>`;
   }).join("");
 
@@ -1475,42 +1690,30 @@ function showFinal() {
       <span class="ses-chip" style="--c:#0f766e">おつかれさま！</span>
       <span class="ses-progress">${esc(session.set.title)}・${session.mode === "exam" ? "本番モード" : "練習モード"}</span>
     </div>
-    ${resultCard}
+    <div id="final-result">${finalResultHtml()}</div>
     <div id="final-table">${finalTableHtml()}</div>
     <div class="ai-slot" data-ai="all"></div>
     ${rows}
     <div class="btn-row">
       <button class="btn primary wide" data-act="save">記録して終わる</button>
     </div>
-    <p class="foot-note">⚠️ 録音はこの画面を閉じると消えます。残したい録音は「⬇️ 録音を保存」を押してください。</p>
+    ${IN_ARTIFACT ? "" : '<p class="foot-note">⚠️ 録音はこの画面を閉じると消えます。残したい録音は「⬇️ 録音を保存」を押してください。</p>'}
   `;
   bindSayButtons($app());
-  fillAiSlots();
-
-  const update = () => {
-    if (overall) return { rate: overall.ratio, grade: overall.grade };
-    const boxes = Array.from($app().querySelectorAll(".self-check"));
-    const rate = boxes.length ? boxes.filter((b) => b.checked).length / boxes.length : 0;
-    const g = GRADE_TABLE.find((x) => rate >= x.min) || GRADE_TABLE[GRADE_TABLE.length - 1];
-    const num = document.getElementById("rate-num");
-    const est = document.getElementById("grade-est");
-    if (num) num.textContent = Math.round(rate * 100) + "%";
-    if (est) { est.textContent = g.grade; est.className = "hist-grade big g-" + g.grade; }
-    return { rate, grade: g.grade };
-  };
-  $app().onchange = (e) => { if (e.target.classList.contains("self-check")) update(); };
-  update();
+  bindSelfChecks($app(), () => updateFinalGrade());
+  fillAnswerSlots();
+  updateFinalGrade();
 
   $app().querySelector("button[data-act='save']").onclick = () => {
-    const { rate, grade } = update();
+    const r = updateFinalGrade() || { rate: 0, grade: "F", auto: false };
     const d = new Date();
     History.add({
       date: `${d.getMonth() + 1}/${d.getDate()}`,
       title: session.set.title + (session.parts.length < 4 ? "（パート別）" : ""),
       mode: session.mode,
-      rate: Math.round(rate * 100),
-      grade,
-      auto: !!overall,
+      rate: Math.round(r.rate * 100),
+      grade: r.grade,
+      auto: r.auto,
     });
     showHome();
   };

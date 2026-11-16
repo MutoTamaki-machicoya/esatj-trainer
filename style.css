@@ -416,3 +416,4 @@ body { text-wrap: pretty; }
 /* 日本語は文節で折り返す（lang="ja" が前提。app.js の起動時に設定） */
 .ai-line, .situation, .lead, .ask-label, .score-advice, .tips li, .theme-card .jp-inline, .part-card p { word-break: auto-phrase; }
 .watch.point { background: #f0fdf4; }
+.env-where { font-size: 0.85rem; margin-bottom: 4px; }
