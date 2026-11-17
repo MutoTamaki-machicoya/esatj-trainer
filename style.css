@@ -319,6 +319,7 @@ button { font-family: inherit; }
 .test-row .mk { font-weight: 800; font-size: 1.1rem; }
 .test-row.yes .mk { color: var(--ok); }
 .test-row.no .mk { color: var(--danger); }
+.test-row.na .mk { color: var(--muted); }
 .test-row small { display: block; color: var(--muted); font-size: 0.82rem; }
 .test-say { font-size: 1.05rem; text-align: center; margin-bottom: 6px; }
 

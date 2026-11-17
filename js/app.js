@@ -883,6 +883,8 @@ async function runMicTest(btn) {
   Beep.init();
   const line = (ok, label, note) => `<div class="test-row ${ok ? "yes" : "no"}"><span class="mk">${ok ? "◎" : "✕"}</span><span><b>${esc(label)}</b><small>${esc(note)}</small></span></div>`;
   const aiLine = AI.on() ? line(true, "Claude採点", "この端末で使えます（振り返り画面と最終画面にボタンが出ます）") : "";
+  // Webサイト版ではClaude採点は使わない（教室のパソコンのClaude版だけ）。故障に見えないよう ✕ ではなく「－」で出す
+  const naLine = `<div class="test-row na"><span class="mk">－</span><span><b>Claude採点</b><small>このWebサイト版では使いません（教室のパソコンの「Claude版」だけで使えます）。ここは正常です</small></span></div>`;
   const ttsLine = line(TTS.available(), "質問の読み上げ", TTS.available() ? "使えます" : "英語の音声が見つかりません（質問は文字で出します）");
   const where = `<p class="env-where">開き方：<b>${IN_ARTIFACT ? "Claudeのアーティファクト" : "ふつうのWebブラウザ"}</b></p>`;
 
@@ -926,7 +928,7 @@ async function runMicTest(btn) {
     box.innerHTML = `<div class="card test-card">${where}
       ${line(false, "録音", Rec.supported ? "マイクが使えません。ブラウザのマイク許可を確認してください" : "このブラウザは録音に対応していません")}
       ${line(false, "自動採点", "マイクが使えないため採点もできません")}
-      ${line(false, "Claude採点", "アーティファクトで開いたときだけ使えます")}${ttsLine}
+      ${naLine}${ttsLine}
       <p class="muted small">Chromeで開き直すと解決することが多いです。録音なしでもタイマー練習はできます。</p></div>`;
     btn.disabled = false;
     return;
@@ -936,7 +938,7 @@ async function runMicTest(btn) {
     box.innerHTML = `<div class="card test-card">${where}
       ${line(true, "録音", "使えます")}
       ${line(false, "自動採点", SR_CTOR ? "設定でオフになっています" : "このブラウザは音声認識に未対応です（Chrome推奨）")}
-      ${line(false, "Claude採点", "アーティファクトで開いたときだけ使えます")}${ttsLine}
+      ${naLine}${ttsLine}
       <p class="muted small">録音の聞き直しと解答例での自己チェックは使えます。</p></div>`;
     Rec.release();
     btn.disabled = false;
@@ -958,7 +960,7 @@ async function runMicTest(btn) {
   box.innerHTML = `<div class="card test-card">${where}
     ${line(true, "録音", "使えます")}
     ${line(!!heard, "文字起こし・自動採点（ブラウザの音声認識）", heard ? "声を英語として聞き取れました" : (SR.failed ? "音声認識がブロックされました" : "声を拾えませんでした"))}
-    ${line(false, "Claude採点", "アーティファクトで開いたときだけ使えます")}${ttsLine}
+    ${naLine}${ttsLine}
     ${heard ? `<p class="transcript">📝 聞き取り結果：<br>"${esc(heard)}"</p>` : '<p class="muted small">マイクに近づく／静かな場所で／英語で話す、を試してください。それでもダメなら録音だけで練習できます。</p>'}
     <button class="btn tiny ghost" data-act="mictest">もう一度ためす</button></div>`;
   btn.disabled = false;
