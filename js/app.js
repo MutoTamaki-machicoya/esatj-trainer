@@ -53,8 +53,19 @@ const History = {
 };
 
 /* ---------- 読み上げ (TTS) ---------- */
+// iPhone / iPad（マイクを使ったままだと、読み上げや録音の再生が小さくなる・出ないことがある）
+const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 const TTS = {
   voice: null,
+  _u: null, // 読み上げ中の発話を持っておく（途中で回収されて止まるのを防ぐ）
+  // 声の一覧から、選んである声を取り直す（スマホでは古い声の指定だと音が出ないことがある）
+  freshVoice() {
+    if (!this.voice) return null;
+    try {
+      return speechSynthesis.getVoices().find((v) => v.name === this.voice.name && v.lang === this.voice.lang) || null;
+    } catch (e) { return null; }
+  },
   pick() {
     if (!("speechSynthesis" in window)) return;
     const vs = speechSynthesis.getVoices().filter((v) => v.lang && v.lang.toLowerCase().startsWith("en"));
@@ -85,9 +96,13 @@ const TTS = {
   stop() { try { speechSynthesis.cancel(); } catch (e) {} },
   // onend は「全再生が終わったとき」に必ず1回だけ呼ぶ。
   // onendが発火しないブラウザ対策として、文の長さから見積もった上限時間で強制的に先へ進む。
-  speak(text, { times = 1, gap = 700, onend = null } = {}) {
-    if (!this.available()) { if (onend) onend(); return; }
-    this.stop();
+  // force: 英語の声が一覧に無くても、端末の既定の声で読ませてみる（お手本ボタン用）
+  speak(text, { times = 1, gap = 700, onend = null, onstart = null, onerror = null, force = false } = {}) {
+    if (!("speechSynthesis" in window)) { if (onerror) onerror("unsupported"); if (onend) onend(); return; }
+    if (!this.voice) this.pick(); // 声の一覧があとから届く端末がある
+    if (!this.available() && !force) { if (onend) onend(); return; }
+    let busy = false;
+    try { busy = speechSynthesis.speaking || speechSynthesis.pending; } catch (e) {}
     let finished = false;
     const finish = () => {
       if (finished) return;
@@ -101,18 +116,23 @@ const TTS = {
     const say = () => {
       if (finished) return;
       const u = new SpeechSynthesisUtterance(text);
-      u.voice = this.voice;
-      u.lang = this.voice.lang || "en-US";
+      const v = this.freshVoice();
+      if (v) u.voice = v;
+      u.lang = (v && v.lang) || "en-US";
       u.rate = Settings.data.rate;
+      u.onstart = () => { if (onstart) onstart(); };
       u.onend = () => {
         count += 1;
         if (count < times) setTimeout(say, gap);
         else { clearTimeout(guard); finish(); }
       };
-      u.onerror = () => { clearTimeout(guard); finish(); };
+      u.onerror = (e) => { clearTimeout(guard); if (onerror) onerror((e && e.error) || "error"); finish(); };
+      this._u = u;
       speechSynthesis.speak(u);
     };
-    say();
+    // 前の読み上げを止めた直後に話させると、スマホでは音が出ないことがある → 止めたときだけ少し待つ
+    if (busy) { this.stop(); setTimeout(say, 150); }
+    else { try { speechSynthesis.resume(); } catch (e) {} say(); }
   },
 };
 
@@ -1354,6 +1374,7 @@ function showQuestion() {
   const id = bump();
   Timer.stop();
   TTS.stop();
+  if (session.micOK && !Rec.stream) Rec.init(); // 振り返りで放したマイク（iPhone）を、次の問題の前に取り直す
   const it = session.items[session.cur];
   const data = itemData(it, session.set);
   const T = timingOf(it, data);
@@ -1579,16 +1600,40 @@ function scoreCardHtml(ans) {
   return `<div class="score-box none"><b>自動採点できませんでした</b><small>${esc(why)}</small><small>下の欄に英語を入れて「✅ この英語で自動採点」を押すか、解答例と比べて自己チェックしましょう。</small></div>`;
 }
 
+const SAY_HELP = "音が出ないときは、音量と消音（マナー）モードを確かめて、もう一度押してください。";
 function bindSayButtons(root) {
   if (!root) return;
   root.querySelectorAll("button[data-say]").forEach((b) => {
-    if (!TTS.available()) { b.style.display = "none"; return; }
-    b.onclick = () => TTS.speak(b.dataset.say, {});
+    if (!("speechSynthesis" in window)) { b.style.display = "none"; return; }
+    const label = b.textContent;
+    b.onclick = () => {
+      if (b.dataset.playing === "1") { TTS.stop(); b.dataset.playing = ""; b.textContent = label; return; }
+      // iPhone：マイクを使ったままだと音が小さい・出ないので、聞く前にマイクを放す（次の問題でまた使う）
+      if (IS_IOS) Rec.release();
+      let note = b.nextElementSibling;
+      if (!note || !note.classList.contains("say-note")) {
+        note = document.createElement("div");
+        note.className = "say-note muted small";
+        b.insertAdjacentElement("afterend", note);
+      }
+      note.textContent = "";
+      let started = false;
+      b.dataset.playing = "1";
+      b.textContent = "⏹ 止める";
+      const timer = setTimeout(() => { if (!started && b.dataset.playing === "1") note.textContent = SAY_HELP; }, 2500);
+      TTS.speak(b.dataset.say, {
+        force: true,
+        onstart: () => { started = true; },
+        onerror: (code) => { if (code !== "interrupted" && code !== "canceled") note.textContent = SAY_HELP + "（" + code + "）"; },
+        onend: () => { clearTimeout(timer); b.dataset.playing = ""; b.textContent = label; },
+      });
+    };
   });
 }
 
 function showReviewOne() {
   bump();
+  if (IS_IOS) Rec.release(); // iPhone：録音の聞き直しとお手本を、ふつうの音量で聞けるように
   const it = session.items[session.cur];
   const data = itemData(it, session.set);
   const ans = session.answers[data.id] || {};
