@@ -23,7 +23,8 @@ const SR_CTOR = IN_ARTIFACT ? null : (window.SpeechRecognition || window.webkitS
 
 const Settings = {
   // srOn は自動採点の土台。使えない端末では実行時に自動で落ちる
-  data: { showText: false, srOn: !!SR_CTOR, rate: 0.95 },
+  // gradeCode / gradePass：Web版のClaude採点のログイン（先生が決めた生徒コード＋その子の合言葉。この端末にだけ保存）
+  data: { showText: false, srOn: !!SR_CTOR, rate: 0.95, gradeCode: "", gradePass: "" },
   load() {
     try {
       const raw = localStorage.getItem("esatj_settings_v1");
@@ -259,12 +260,26 @@ const AI_LEVELS = ["A2.2", "A2.1", "A1.3", "A1.2", "A1.1", "PreA1", "判定不�
 const AI_NOTE = "文字起こしを元にした目安です。発音は採点していません。";
 
 const AI = {
-  sample: null,     // claude.use("sample") の結果
+  sample: null,     // claude.use("sample") の結果（Web版は中継を呼ぶ同じ形のもの）
+  web: false,       // true＝Web版（github.io）：中継サーバー経由で採点・生徒コード＋合言葉のログインが要る
   blocked: false,   // not_granted など、この画面では二度と出さない
   allBusy: false,
   on() { return !!this.sample && !this.blocked; },
+  needLogin() { return this.web && !isLoggedIn(Settings.data); },
   async init() {
-    if (!IN_ARTIFACT) return; // ローカル版・ふつうのブラウザ
+    if (!IN_ARTIFACT) {
+      // Web版：js/config.js に中継のURLが入っているときだけ Claude採点を出す（空なら今までどおり出さない）
+      const url = typeof window.ESATJ_GRADER_URL === "string" ? window.ESATJ_GRADER_URL.trim() : "";
+      if (url && typeof relayJson === "function") {
+        this.web = true;
+        this.sample = {
+          json: (prompt, o) => relayJson(url, { code: Settings.data.gradeCode, pass: Settings.data.gradePass }, prompt,
+            o && o.meta, { signal: o && o.signal }),
+        };
+        fillAnswerSlots();
+      }
+      return;
+    }
     const c = window.claude;
     const safe = (name) => { try { return Promise.resolve(c.use(name)).catch(() => null); } catch (e) { return Promise.resolve(null); } };
     const [smp, d] = await Promise.all([safe("sample"), safe("dictation")]);
@@ -278,7 +293,17 @@ const AI = {
     const code = e && e.code ? e.code : "upstream_error";
     const hide = ["not_granted", "sampling_disabled", "not_declared", "capability_disabled", "capability_removed"];
     if (hide.includes(code)) { this.blocked = true; fillAnswerSlots(); return; }
+    if (code === "bad_passcode") {
+      // 保存済みのログインを消して、入力の行をもう一度出す
+      clearLogin(Settings.data);
+      Settings.save();
+      fillLoginSlots();
+    }
     const msg = {
+      bad_passcode: "生徒コードか合言葉が違います。先生に確かめてください。",
+      daily_limit: "今日の採点の回数がいっぱいです。先生に伝えてください。",
+      student_limit: "今日はここまでです。明日また使えます。",
+      too_many_fails: "ログインに何度も失敗しました。しばらくしてからやり直してください。",
       cancelled: "採点を止めました。",
       rate_limited: "Claudeの利用が混み合っています。少し待ってから、もう一度押してください。",
       session_expired: "Claudeへのログインが切れています。ログインし直してから押してください。",
@@ -380,6 +405,49 @@ function envNoteHtml() {
 }
 function refreshEnvNotes() {
   document.querySelectorAll(".env-note").forEach((el) => { el.innerHTML = envNoteHtml(); });
+}
+
+/* ---------- Web版：ログイン（生徒コード＋その子の合言葉） ----------
+   Claude採点のパネルの中に専用の枠（.pass-slot）を置く。未ログインなら入力の行、ログイン中なら「ログイン中：S1」＋「切り替え」。
+   ステータス文（.ai-status）とは別の枠なので、エラー文を消さずに出し直せる。画面に生徒の名前は出さない（コードだけ） */
+const LOGIN_LABEL = "ログイン（先生から渡された生徒コードと合言葉）";
+const LOGIN_NEEDED_MSG = "先にログインしてください。";
+function fillLoginSlots() {
+  document.querySelectorAll(".pass-slot").forEach((el) => {
+    if (!AI.web || !AI.on()) { el.innerHTML = ""; return; }
+    if (isLoggedIn(Settings.data)) {
+      el.innerHTML = `
+        <div class="login-now">
+          <span>ログイン中：<b>${esc(Settings.data.gradeCode)}</b></span>
+          <button class="btn tiny ghost login-switch" type="button">切り替え</button>
+        </div>`;
+      el.querySelector(".login-switch").onclick = () => {
+        clearLogin(Settings.data);
+        Settings.save();
+        fillLoginSlots();
+      };
+      return;
+    }
+    el.innerHTML = `
+      <div class="pass-row">
+        <label class="ai-label">${esc(LOGIN_LABEL)}</label>
+        <div class="pass-line">
+          <input type="text" class="login-code" placeholder="生徒コード" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="生徒コード">
+          <input type="password" class="pass-input" placeholder="合言葉" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="合言葉">
+          <button class="btn tiny secondary login-go" type="button">ログイン</button>
+        </div>
+      </div>`;
+    const codeIn = el.querySelector(".login-code");
+    const passIn = el.querySelector(".pass-input");
+    const login = () => {
+      if (!saveLogin(Settings.data, codeIn.value, passIn.value)) { (codeIn.value.trim() ? passIn : codeIn).focus(); return; }
+      Settings.save();
+      fillLoginSlots(); // ログインしたら「ログイン中：S1」に変わる（この端末に保存）
+      document.querySelectorAll(".ai-status").forEach((st) => { if (st.textContent === LOGIN_NEEDED_MSG) st.textContent = ""; });
+    };
+    el.querySelector(".login-go").onclick = login;
+    passIn.addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+  });
 }
 
 // 令和8年度 採点基準（都教委公開）の要約。Claudeへの指示に使う
@@ -620,7 +688,7 @@ function fillAnswerItem(slot) {
         ${ai ? '<button class="btn secondary ai-go" type="button">🤖 Claudeに採点してもらう</button>' : ""}
       </div>
       <div class="ai-status muted small"></div>
-      ${ai ? `<div class="ai-out">${aiResultHtml(ans.ai)}</div><p class="ai-note">※ ${AI_NOTE}</p>` : ""}
+      ${ai ? `<div class="pass-slot"></div><div class="ai-out">${aiResultHtml(ans.ai)}</div><p class="ai-note">※ ${AI_NOTE}</p>` : ""}
     </div>`;
   const ta = slot.querySelector(".ai-text");
   const status = slot.querySelector(".ai-status");
@@ -645,8 +713,10 @@ function fillAnswerItem(slot) {
   if (!go) return;
   bindSayButtons(slot.querySelector(".ai-out"));
   if (ans.aiBusy) { go.disabled = true; status.textContent = "🤖 Claudeが採点しています…"; }
+  fillLoginSlots();
   go.onclick = async () => {
     if (ans.aiBusy) return;
+    if (AI.needLogin()) { status.textContent = LOGIN_NEEDED_MSG; return; }
     ans.manual = ta.value;
     ans.aiBusy = true;
     go.disabled = true;
@@ -654,7 +724,9 @@ function fillAnswerItem(slot) {
     status.innerHTML = '🤖 Claudeが採点しています…（10〜60秒ほど） <button class="btn tiny ghost ai-stop" type="button">止める</button>';
     status.querySelector(".ai-stop").onclick = () => ctl.abort();
     try {
-      const raw = await AI.sample.json(aiPromptOne(it, data, ans, session.set), { signal: ctl.signal });
+      const opt = { signal: ctl.signal };
+      if (AI.web) opt.meta = buildMeta("one", session.set.title, it.part, data.id); // 記録用（Web版の中継だけ）
+      const raw = await AI.sample.json(aiPromptOne(it, data, ans, session.set), opt);
       ans.ai = normAi(raw);
       // 画面を移動していても結果は記録しておく（最終画面の表に出る）
       const live = document.querySelector(`.ai-slot[data-ai="item"][data-qid="${qid}"]`);
@@ -680,8 +752,10 @@ function fillAiAll(slot) {
   const res = session.aiAll;
   slot.innerHTML = `
     <div class="ai-panel all">
-      <div class="ai-panel-title">🤖 Claude採点（教室の端末用）</div>
+      <div class="ai-panel-title">🤖 Claude採点</div>
       <p class="muted small">全${session.items.length}問の文字起こし（下の各問の欄で直した内容を含む）を、令和8年度の採点基準でまとめて判定します。</p>
+      ${AI.web ? '<p class="muted small">採点のために、問題と書き起こしの英文が塾のClaudeに送られ、採点の記録（セット・Part・結果）が生徒コードごとに保存されます。名前と録音は送りません。</p>' : ""}
+      <div class="pass-slot"></div>
       <button class="btn secondary wide ai-go-all" type="button">🤖 全問まとめてClaudeに採点してもらう</button>
       <div class="ai-status muted small"></div>
       ${res && res.summary ? `<p class="score-advice">💬 ${esc(res.summary)}</p>` : ""}
@@ -690,8 +764,10 @@ function fillAiAll(slot) {
   const go = slot.querySelector(".ai-go-all");
   const status = slot.querySelector(".ai-status");
   if (AI.allBusy) { go.disabled = true; status.textContent = "🤖 Claudeが採点しています…"; }
+  fillLoginSlots();
   go.onclick = async () => {
     if (AI.allBusy) return;
+    if (AI.needLogin()) { status.textContent = LOGIN_NEEDED_MSG; return; }
     AI.allBusy = true;
     go.disabled = true;
     const ctl = new AbortController();
@@ -699,7 +775,9 @@ function fillAiAll(slot) {
     status.querySelector(".ai-stop").onclick = () => ctl.abort();
     const sess = session;
     try {
-      const raw = await AI.sample.json(aiPromptAll(sess), { signal: ctl.signal });
+      const opt = { signal: ctl.signal };
+      if (AI.web) opt.meta = buildMeta("all", sess.set.title);
+      const raw = await AI.sample.json(aiPromptAll(sess), opt);
       const o = raw && typeof raw === "object" ? raw : {};
       const parts = {};
       Object.keys(o.parts || {}).forEach((p) => { if (PART_META[p]) parts[p] = normLevel(o.parts[p]); });
@@ -884,7 +962,11 @@ async function runMicTest(btn) {
   const line = (ok, label, note) => `<div class="test-row ${ok ? "yes" : "no"}"><span class="mk">${ok ? "◎" : "✕"}</span><span><b>${esc(label)}</b><small>${esc(note)}</small></span></div>`;
   const aiLine = AI.on() ? line(true, "Claude採点", "この端末で使えます（振り返り画面と最終画面にボタンが出ます）") : "";
   // Webサイト版ではClaude採点は使わない（教室のパソコンのClaude版だけ）。故障に見えないよう ✕ ではなく「－」で出す
-  const naLine = `<div class="test-row na"><span class="mk">－</span><span><b>Claude採点</b><small>このWebサイト版では使いません（教室のパソコンの「Claude版」だけで使えます）。ここは正常です</small></span></div>`;
+  // 中継のURLが入っている Web版では使える（ログインが必要）。URLが空のときだけ「－」
+  const naLine = AI.web && AI.on()
+    ? line(true, "Claude採点", "使えます（生徒コードと合言葉でログインが必要です）")
+      + (isLoggedIn(Settings.data) ? `<p class="env-where">ログイン中：${esc(Settings.data.gradeCode)}</p>` : "")
+    : `<div class="test-row na"><span class="mk">－</span><span><b>Claude採点</b><small>このWebサイト版では使いません（教室のパソコンの「Claude版」だけで使えます）。ここは正常です</small></span></div>`;
   const ttsLine = line(TTS.available(), "質問の読み上げ", TTS.available() ? "使えます" : "英語の音声が見つかりません（質問は文字で出します）");
   const where = `<p class="env-where">開き方：<b>${IN_ARTIFACT ? "Claudeのアーティファクト" : "ふつうのWebブラウザ"}</b></p>`;
 
@@ -1067,7 +1149,7 @@ function showSettings() {
       音声の読み上げ：${TTS.available() ? "✅ 利用できます" : "⚠️ このブラウザでは英語音声が見つかりません（質問は文字で表示されます）"}<br>
       録音機能：${Rec.supported ? "✅ 利用できます（開始時にマイク許可が必要）" : IN_ARTIFACT ? "— この開き方では録音できません" : "⚠️ このブラウザでは録音できません（タイマー練習のみ）"}<br>
       文字起こし：${IN_ARTIFACT ? (Dict.usable() ? "✅ 音声入力（🎙）で文字にします" : "— この閲覧者では使えません（講師の手入力と自己チェック）") : (SR_CTOR ? "✅ ブラウザの音声認識（Chrome）" : "⚠️ このブラウザでは利用できません（Chrome推奨）")}<br>
-      Claude採点：${AI.on() ? "✅ この端末で使えます（教室用）" : "— この画面では使えません（塾のClaudeアカウントでログインした教室の端末で使えます）"}</p>
+      Claude採点：${AI.web ? (AI.on() ? "✅ 使えます（生徒コードと合言葉でログインが必要です）" + (isLoggedIn(Settings.data) ? "<br>ログイン中：" + esc(Settings.data.gradeCode) : "") : "— 使えません") : AI.on() ? "✅ この端末で使えます（教室用）" : "— この画面では使えません（塾のClaudeアカウントでログインした教室の端末で使えます）"}</p>
       <p class="muted small">録音ファイルと採点結果は端末の中だけに保存されます。聞き取り自体はブラウザの音声認識機能を使うため、Chromeでは音声がGoogleの認識サービスで処理されます。Claude採点は、ボタンを押したときだけ問題文と文字起こし（録音そのものや名前は送りません）をClaudeに送ります。</p>
     </div>
     <button class="btn primary wide" data-act="home">保存してもどる</button>

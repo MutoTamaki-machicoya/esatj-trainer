@@ -421,3 +421,10 @@ body { text-wrap: pretty; }
 .ai-line, .situation, .lead, .ask-label, .score-advice, .tips li, .theme-card .jp-inline, .part-card p { word-break: auto-phrase; }
 .watch.point { background: #f0fdf4; }
 .env-where { font-size: 0.85rem; margin-bottom: 4px; }
+
+/* Web版のClaude採点：合言葉の行 */
+.pass-row { margin: 8px 0; padding: 8px 10px; background: #fff; border: 1.5px dashed #c7d2fe; border-radius: 10px; }
+.pass-line { display: flex; gap: 8px; align-items: center; }
+.pass-input { flex: 1; min-width: 0; font-size: 1rem; padding: 8px 10px; border: 1.5px solid var(--line); border-radius: 8px; }
+.pass-line .login-code { width: 6.5em; flex: 0 0 auto; font-size: 1rem; padding: 8px 10px; border: 1.5px solid var(--line); border-radius: 8px; text-transform: uppercase; }
+.login-now { display: flex; align-items: center; gap: 10px; justify-content: space-between; margin: 8px 0; font-size: 0.88rem; color: #3730a3; }
