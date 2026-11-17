@@ -282,7 +282,13 @@ const Rec = {
     try {
       this.chunks = [];
       this.mime = this.pickMime();
-      this.recorder = this.mime ? new MediaRecorder(this.stream, { mimeType: this.mime }) : new MediaRecorder(this.stream);
+      // 中継へ送る録音を小さくするため 32kbps を指定（指定で失敗する端末は今までどおり）
+      const opts = this.mime ? { mimeType: this.mime } : {};
+      try {
+        this.recorder = new MediaRecorder(this.stream, Object.assign({ audioBitsPerSecond: 32000 }, opts));
+      } catch (e) {
+        this.recorder = this.mime ? new MediaRecorder(this.stream, { mimeType: this.mime }) : new MediaRecorder(this.stream);
+      }
       this.mime = this.recorder.mimeType || this.mime || "audio/webm";
       this.recorder.ondataavailable = (e) => { if (e.data && e.data.size) this.chunks.push(e.data); };
       this.recorder.start();
@@ -299,7 +305,7 @@ const Rec = {
       r.onstop = () => {
         const blob = new Blob(this.chunks, { type: this.mime });
         this.recorder = null;
-        resolve(blob.size ? { url: URL.createObjectURL(blob), mime: this.mime } : null);
+        resolve(blob.size ? { url: URL.createObjectURL(blob), mime: this.mime, blob: blob } : null);
       };
       try { r.stop(); } catch (e) { resolve(null); }
     });
@@ -371,6 +377,7 @@ const AI_NOTE = "文字起こしを元にした目安です。発音は採点し
 const AI = {
   sample: null,     // claude.use("sample") の結果（Web版は中継を呼ぶ同じ形のもの）
   web: false,       // true＝Web版（github.io）：中継サーバー経由で採点・生徒コード＋合言葉のログインが要る
+  url: "",          // Web版の中継のURL（js/config.js）
   blocked: false,   // not_granted など、この画面では二度と出さない
   allBusy: false,
   on() { return !!this.sample && !this.blocked; },
@@ -381,11 +388,13 @@ const AI = {
       const url = typeof window.ESATJ_GRADER_URL === "string" ? window.ESATJ_GRADER_URL.trim() : "";
       if (url && typeof relayJson === "function") {
         this.web = true;
+        this.url = url;
         this.sample = {
           json: (prompt, o) => relayJson(url, { code: Settings.data.gradeCode, pass: Settings.data.gradePass }, prompt,
             o && o.meta, { signal: o && o.signal }),
         };
         fillAnswerSlots();
+        fillLoginSlots(); // ホームの「まずログイン」も出す
       }
       return;
     }
@@ -408,7 +417,11 @@ const AI = {
       Settings.save();
       fillLoginSlots();
     }
-    const msg = {
+    if (statusEl) statusEl.textContent = this.msgFor(code);
+  },
+  msgFor(code) {
+    return {
+      audio_too_large: "録音が長すぎて送れません。下の欄に英語を入れてください。",
       bad_passcode: "生徒コードか合言葉が違います。先生に確かめてください。",
       daily_limit: "今日の採点の回数がいっぱいです。先生に伝えてください。",
       student_limit: "今日はここまでです。明日また使えます。",
@@ -421,7 +434,6 @@ const AI = {
       empty_completion: "この解答は採点できませんでした。文字起こしを直して、もう一度押してください。",
       prompt_too_large: "解答が長すぎて送れません。文字起こしを短くしてください。",
     }[code] || "通信が途切れました。もう一度押してください。";
-    if (statusEl) statusEl.textContent = msg;
   },
 };
 
@@ -496,6 +508,13 @@ const Dict = {
   },
 };
 
+// Whisper（中継の文字起こし）を使えるか：Web版・中継URLあり・ログイン済み・録音できる
+function useWhisper() {
+  return typeof canUseWhisper === "function" && canUseWhisper({
+    inArtifact: IN_ARTIFACT, url: AI.url, loggedIn: isLoggedIn(Settings.data), recSupported: Rec.supported,
+  });
+}
+
 // どの開き方で、何が使えるか（ホームの動作チェック・設定・各Partの説明に出す）
 function envSummary() {
   return {
@@ -520,16 +539,21 @@ function refreshEnvNotes() {
    Claude採点のパネルの中に専用の枠（.pass-slot）を置く。未ログインなら入力の行、ログイン中なら「ログイン中：S1」＋「切り替え」。
    ステータス文（.ai-status）とは別の枠なので、エラー文を消さずに出し直せる。画面に生徒の名前は出さない（コードだけ） */
 const LOGIN_LABEL = "ログイン（先生から渡された生徒コードと合言葉）";
+// Web版で中継に送るものの説明（最終画面のClaude採点の枠・設定画面）
+const WEB_SEND_NOTE = "採点と文字起こしのために、録音・問題・書き起こしの英文が塾の中継に送られます。録音は文字にしたあと保存されません。採点の記録（セット・Part・結果）は生徒コードごとに保存されます。名前は送りません。";
 const LOGIN_NEEDED_MSG = "先にログインしてください。";
+const HOME_LOGIN_TITLE = "まずログイン";
+const HOME_LOGIN_DESC = "ログインすると、録音を正確に文字にして、Claude採点も使えます。";
 function fillLoginSlots() {
   document.querySelectorAll(".pass-slot").forEach((el) => {
+    const home = el.dataset.home === "1"; // ホームのカード（解く前にログインさせる）
     if (!AI.web || !AI.on()) { el.innerHTML = ""; return; }
     if (isLoggedIn(Settings.data)) {
-      el.innerHTML = `
+      el.innerHTML = `${home ? '<div class="card login-card">' : ""}
         <div class="login-now">
           <span>ログイン中：<b>${esc(Settings.data.gradeCode)}</b></span>
           <button class="btn tiny ghost login-switch" type="button">切り替え</button>
-        </div>`;
+        </div>${home ? "</div>" : ""}`;
       el.querySelector(".login-switch").onclick = () => {
         clearLogin(Settings.data);
         Settings.save();
@@ -537,15 +561,15 @@ function fillLoginSlots() {
       };
       return;
     }
-    el.innerHTML = `
+    el.innerHTML = `${home ? `<div class="card login-card"><h2>${esc(HOME_LOGIN_TITLE)}</h2><p class="muted">${esc(HOME_LOGIN_DESC)}</p>` : ""}
       <div class="pass-row">
-        <label class="ai-label">${esc(LOGIN_LABEL)}</label>
+        ${home ? "" : `<label class="ai-label">${esc(LOGIN_LABEL)}</label>`}
         <div class="pass-line">
           <input type="text" class="login-code" placeholder="生徒コード" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="生徒コード">
           <input type="password" class="pass-input" placeholder="合言葉" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="合言葉">
           <button class="btn tiny secondary login-go" type="button">ログイン</button>
         </div>
-      </div>`;
+      </div>${home ? "</div>" : ""}`;
     const codeIn = el.querySelector(".login-code");
     const passIn = el.querySelector(".pass-input");
     const login = () => {
@@ -730,7 +754,7 @@ function selfChecksOf(it, data) {
 }
 
 function selfCheckHtml(it, data, ans) {
-  if (ans && ans.score) return "";
+  if (ans && (ans.score || ans.sttBusy)) return ""; // 文字起こしを待っている間は出さない
   const done = (ans && ans.self) || {};
   return `
     <div class="checks" data-qid="${esc(data.id)}">
@@ -749,6 +773,64 @@ function bindSelfChecks(root, onChange) {
       if (onChange) onChange();
     };
   });
+}
+
+/* ---------- Whisper：録音を中継へ送って文字にする（裏で進める・次の問題を止めない） ---------- */
+const STT_WAIT = "📝 録音を文字にしています…";
+const STT_FAIL = "文字にできませんでした。下の欄に英語を入れるか、もう一度話してください。";
+const STT_EMPTY = "声が聞き取れませんでした";
+function startStt(sess, it, data, ans, blob) {
+  ans.sttBusy = true;
+  ans.sttError = "";
+  transcribe({ url: AI.url, code: Settings.data.gradeCode, pass: Settings.data.gradePass, blob: blob })
+    .then((text) => {
+      ans.sttBusy = false;
+      ans.transcript = text;
+      ans.sttEmpty = !text;
+      // 講師が手で直していれば、その英語のまま（answerTextOf は手入力を優先）
+      ans.score = scoreAnswer(it.part, { qid: data.id, setId: sess.set.id, prev: sttPrevText(sess, it) }, data.text, answerTextOf(ans));
+    })
+    .catch((e) => {
+      ans.sttBusy = false;
+      const code = e && e.code ? e.code : "upstream_error";
+      if (code === "bad_passcode") { clearLogin(Settings.data); Settings.save(); fillLoginSlots(); }
+      ans.sttError = ["bad_passcode", "student_limit", "daily_limit", "too_many_fails"].includes(code) ? AI.msgFor(code) : STT_FAIL;
+    })
+    .then(() => { if (session === sess) refreshSttViews(it, data); });
+}
+function sttPrevText(sess, it) {
+  if (it.part !== "B" || it.idx !== 1) return "";
+  return answerTextOf(sess.answers[sess.set.B.questions[0].id]);
+}
+function transcriptHtml(ans, long) {
+  if (!ans || !ans.transcript) return "";
+  return long ? `<p class="transcript">📝 聞き取った内容：<br>"${esc(ans.transcript)}"</p>` : `<p class="transcript">📝 "${esc(ans.transcript)}"</p>`;
+}
+// 文字起こしが届いたら：採点カード・聞き取った内容・解答の英語の欄・ボタン・最終画面の表と評価を更新
+function refreshSttViews(it, data) {
+  const ans = session.answers[data.id] || {};
+  document.querySelectorAll(`.tr-area[data-qid="${data.id}"]`).forEach((el) => { el.innerHTML = transcriptHtml(ans, el.dataset.long === "1"); });
+  document.querySelectorAll(`.ai-slot[data-ai="item"][data-qid="${data.id}"]`).forEach((slot) => {
+    const ta = slot.querySelector(".ai-text");
+    if (ta && typeof ans.manual !== "string") ta.value = ans.transcript || "";
+    const go = slot.querySelector(".ai-go");
+    if (go) go.disabled = oneButtonDisabled(ans);
+    const st = slot.querySelector(".ai-status");
+    if (st && st.dataset.stt === "1" && !ans.sttBusy) { st.textContent = ""; st.dataset.stt = ""; }
+  });
+  refreshScoreViews(it, data);
+  refreshAllButton();
+}
+// 最終画面：まだ届いていない数・全問ボタン
+function refreshAllButton() {
+  if (!session) return;
+  const st = allButtonState(session.answers, AI.allBusy);
+  const pend = document.getElementById("stt-pending");
+  if (pend) pend.innerHTML = st.pending ? `<div class="warn-banner stt-wait">📝 文字にしています（あと ${st.pending} 問）</div>` : "";
+  const g = document.querySelector(".ai-go-all");
+  if (g) g.disabled = st.disabled;
+  const note = document.querySelector(".ai-all-note");
+  if (note) note.textContent = st.note;
 }
 
 // 手入力・音声入力で直した英語で、ブラウザ内の自動採点をやり直す
@@ -822,9 +904,10 @@ function fillAnswerItem(slot) {
   if (!go) return;
   bindSayButtons(slot.querySelector(".ai-out"));
   if (ans.aiBusy) { go.disabled = true; status.textContent = "🤖 Claudeが採点しています…"; }
+  if (ans.sttBusy) { go.disabled = true; status.textContent = "文字起こしが終わると押せます"; status.dataset.stt = "1"; }
   fillLoginSlots();
   go.onclick = async () => {
-    if (ans.aiBusy) return;
+    if (oneButtonDisabled(ans)) return;
     if (AI.needLogin()) { status.textContent = LOGIN_NEEDED_MSG; return; }
     ans.manual = ta.value;
     ans.aiBusy = true;
@@ -851,7 +934,7 @@ function fillAnswerItem(slot) {
     } finally {
       ans.aiBusy = false;
       const liveGo = document.querySelector(`.ai-slot[data-ai="item"][data-qid="${qid}"] .ai-go`);
-      if (liveGo) liveGo.disabled = false;
+      if (liveGo) liveGo.disabled = oneButtonDisabled(ans);
     }
   };
 }
@@ -863,9 +946,10 @@ function fillAiAll(slot) {
     <div class="ai-panel all">
       <div class="ai-panel-title">🤖 Claude採点</div>
       <p class="muted small">全${session.items.length}問の文字起こし（下の各問の欄で直した内容を含む）を、令和8年度の採点基準でまとめて判定します。</p>
-      ${AI.web ? '<p class="muted small">採点のために、問題と書き起こしの英文が塾のClaudeに送られ、採点の記録（セット・Part・結果）が生徒コードごとに保存されます。名前と録音は送りません。</p>' : ""}
+      ${AI.web ? `<p class="muted small">${esc(WEB_SEND_NOTE)}</p>` : ""}
       <div class="pass-slot"></div>
       <button class="btn secondary wide ai-go-all" type="button">🤖 全問まとめてClaudeに採点してもらう</button>
+      <div class="ai-all-note muted small"></div>
       <div class="ai-status muted small"></div>
       ${res && res.summary ? `<p class="score-advice">💬 ${esc(res.summary)}</p>` : ""}
       <p class="ai-note">※ ${AI_NOTE}</p>
@@ -874,8 +958,9 @@ function fillAiAll(slot) {
   const status = slot.querySelector(".ai-status");
   if (AI.allBusy) { go.disabled = true; status.textContent = "🤖 Claudeが採点しています…"; }
   fillLoginSlots();
+  refreshAllButton();
   go.onclick = async () => {
-    if (AI.allBusy) return;
+    if (allButtonState(session.answers, AI.allBusy).disabled) return;
     if (AI.needLogin()) { status.textContent = LOGIN_NEEDED_MSG; return; }
     AI.allBusy = true;
     go.disabled = true;
@@ -900,8 +985,7 @@ function fillAiAll(slot) {
       AI.handleError(e, document.querySelector('.ai-slot[data-ai="all"] .ai-status'));
     } finally {
       AI.allBusy = false;
-      const g = document.querySelector(".ai-go-all");
-      if (g) g.disabled = false;
+      refreshAllButton();
     }
   };
 }
@@ -1025,6 +1109,7 @@ function showHome() {
       <button class="btn tiny ghost mic-test" data-act="mictest">🎤 動作チェック（マイク・文字起こし・採点）</button>
       <div id="mictest-result"></div>
     </div>
+    <div class="pass-slot" data-home="1"></div>
 
     <div class="card course-guide">
       <h2>📅 講座での使い方</h2>
@@ -1058,6 +1143,7 @@ function showHome() {
     if (act === "drill") startSession(btn.dataset.set, "practice", [btn.dataset.part]);
     if (act === "mictest") runMicTest(btn);
   };
+  fillLoginSlots();
 }
 
 /* ---------- マイク・自動採点の動作チェック ----------
@@ -1115,6 +1201,37 @@ async function runMicTest(btn) {
 
   box.innerHTML = `<div class="card test-card"><p>マイクを準備しています…<br><small class="muted">「許可」を押してください</small></p></div>`;
   const micOK = await Rec.init();
+  // 未ログインのWeb版（中継あり）では、ログインすると正確に文字にできることを1行足す
+  const loginHint = AI.web && AI.on() && !isLoggedIn(Settings.data) && Rec.supported ? '<p class="muted small">ログインすると、録音を正確に文字にできます</p>' : "";
+
+  if (micOK && useWhisper()) {
+    // 5秒録音 → 中継で文字にする
+    box.innerHTML = `<div class="card test-card"><p class="test-say">英語で話しかけてください<br><b>"Hello, my name is ○○."</b></p><p class="rec-note"><span class="rec-dot"></span> 録音中… 5秒</p></div>`;
+    Beep.start();
+    const started = Rec.start();
+    await new Promise((r) => setTimeout(r, 5000));
+    Beep.end();
+    const rec = started ? await Rec.stop() : null;
+    Rec.release();
+    box.innerHTML = `<div class="card test-card"><p>${esc(STT_WAIT)}</p></div>`;
+    let heard = "", err = "";
+    if (rec && rec.blob) {
+      try { heard = await transcribe({ url: AI.url, code: Settings.data.gradeCode, pass: Settings.data.gradePass, blob: rec.blob }); }
+      catch (e) {
+        const code = e && e.code ? e.code : "upstream_error";
+        if (code === "bad_passcode") { clearLogin(Settings.data); Settings.save(); fillLoginSlots(); }
+        err = ["bad_passcode", "student_limit", "daily_limit", "too_many_fails"].includes(code) ? AI.msgFor(code) : STT_FAIL;
+      }
+    } else err = "録音が取れませんでした。";
+    box.innerHTML = `<div class="card test-card">${where}
+      ${line(!!(rec && rec.blob), "録音", rec && rec.blob ? "使えます" : "録音が取れませんでした")}
+      ${line(!!heard, "文字起こし（録音を送って文字にします）", heard ? "声を英語として文字にできました" : (err || STT_EMPTY))}
+      ${naLine}${ttsLine}
+      ${heard ? `<p class="transcript">📝 聞き取り結果：<br>"${esc(heard)}"</p>` : ""}
+      <button class="btn tiny ghost" data-act="mictest">もう一度ためす</button></div>`;
+    btn.disabled = false;
+    return;
+  }
   if (!micOK) {
     box.innerHTML = `<div class="card test-card">${where}
       ${line(false, "録音", Rec.supported ? "マイクが使えません。ブラウザのマイク許可を確認してください" : "このブラウザは録音に対応していません")}
@@ -1129,7 +1246,7 @@ async function runMicTest(btn) {
     box.innerHTML = `<div class="card test-card">${where}
       ${line(true, "録音", "使えます")}
       ${line(false, "自動採点", SR_CTOR ? "設定でオフになっています" : "このブラウザは音声認識に未対応です（Chrome推奨）")}
-      ${naLine}${ttsLine}
+      ${naLine}${ttsLine}${loginHint}
       <p class="muted small">録音の聞き直しと解答例での自己チェックは使えます。</p></div>`;
     Rec.release();
     btn.disabled = false;
@@ -1151,7 +1268,7 @@ async function runMicTest(btn) {
   box.innerHTML = `<div class="card test-card">${where}
     ${line(true, "録音", "使えます")}
     ${line(!!heard, "文字起こし・自動採点（ブラウザの音声認識）", heard ? "声を英語として聞き取れました" : (SR.failed ? "音声認識がブロックされました" : "声を拾えませんでした"))}
-    ${naLine}${ttsLine}
+    ${naLine}${ttsLine}${loginHint}
     ${heard ? `<p class="transcript">📝 聞き取り結果：<br>"${esc(heard)}"</p>` : '<p class="muted small">マイクに近づく／静かな場所で／英語で話す、を試してください。それでもダメなら録音だけで練習できます。</p>'}
     <button class="btn tiny ghost" data-act="mictest">もう一度ためす</button></div>`;
   btn.disabled = false;
@@ -1257,9 +1374,11 @@ function showSettings() {
       <p class="muted">開き方：<b>${IN_ARTIFACT ? "Claudeのアーティファクト（録音・ブラウザの音声認識は使えません。文字起こしは音声入力🎙）" : "ふつうのWebブラウザ"}</b><br>
       音声の読み上げ：${TTS.available() ? "✅ 利用できます" : "⚠️ このブラウザでは英語音声が見つかりません（質問は文字で表示されます）"}<br>
       録音機能：${Rec.supported ? "✅ 利用できます（開始時にマイク許可が必要）" : IN_ARTIFACT ? "— この開き方では録音できません" : "⚠️ このブラウザでは録音できません（タイマー練習のみ）"}<br>
-      文字起こし：${IN_ARTIFACT ? (Dict.usable() ? "✅ 音声入力（🎙）で文字にします" : "— この閲覧者では使えません（講師の手入力と自己チェック）") : (SR_CTOR ? "✅ ブラウザの音声認識（Chrome）" : "⚠️ このブラウザでは利用できません（Chrome推奨）")}<br>
+      文字起こし：${IN_ARTIFACT ? (Dict.usable() ? "✅ 音声入力（🎙）で文字にします" : "— この閲覧者では使えません（講師の手入力と自己チェック）") : useWhisper() ? "✅ 録音を送って文字にします" : (SR_CTOR ? "✅ ブラウザの音声認識（Chrome）" : "⚠️ このブラウザでは利用できません（Chrome推奨）")}<br>
       Claude採点：${AI.web ? (AI.on() ? "✅ 使えます（生徒コードと合言葉でログインが必要です）" + (isLoggedIn(Settings.data) ? "<br>ログイン中：" + esc(Settings.data.gradeCode) : "") : "— 使えません") : AI.on() ? "✅ この端末で使えます（教室用）" : "— この画面では使えません（塾のClaudeアカウントでログインした教室の端末で使えます）"}</p>
-      <p class="muted small">録音ファイルと採点結果は端末の中だけに保存されます。聞き取り自体はブラウザの音声認識機能を使うため、Chromeでは音声がGoogleの認識サービスで処理されます。Claude採点は、ボタンを押したときだけ問題文と文字起こし（録音そのものや名前は送りません）をClaudeに送ります。</p>
+      <p class="muted small">${AI.web
+        ? esc(WEB_SEND_NOTE) + "ログインしていないときは、ブラウザの音声認識で文字にします（Chromeでは音声がGoogleの認識サービスで処理されます）。"
+        : "録音ファイルと採点結果は端末の中だけに保存されます。聞き取り自体はブラウザの音声認識機能を使うため、Chromeでは音声がGoogleの認識サービスで処理されます。Claude採点は、ボタンを押したときだけ問題文と文字起こし（録音そのものや名前は送りません）をClaudeに送ります。"}</p>
     </div>
     <button class="btn primary wide" data-act="home">保存してもどる</button>
   `;
@@ -1486,7 +1605,9 @@ function showQuestion() {
     Beep.start();
     let recording = false;
     if (session.micOK) recording = Rec.start();
-    SR.start();
+    // Whisper を使うときはブラウザの音声認識を始めない（スマホでは録音と同時にマイクを使えず、認識が空になるため）
+    const whisper = recording && useWhisper();
+    if (!whisper) SR.start();
     // アーティファクト：解答中に確定した文字だけを集める
     const useDict = IN_ARTIFACT && Dict.usable();
     if (useDict) { Dict.buf = ""; Dict.route = "answer"; }
@@ -1518,13 +1639,15 @@ function showQuestion() {
         Dict.buf = "";
       }
       if (!alive(fid)) return;
-      session.answers[data.id] = {
+      const sendStt = whisper && rec && rec.blob;
+      const ans = session.answers[data.id] = {
         url: rec ? rec.url : null,
         mime: rec ? rec.mime : null,
-        transcript: transcript,
+        transcript: sendStt ? "" : transcript,
         secs: secs,
-        score: scoreAnswer(it.part, { qid: data.id, setId: session.set.id, prev: prevAnswerText(it) }, data.text, transcript),
+        score: sendStt ? null : scoreAnswer(it.part, { qid: data.id, setId: session.set.id, prev: prevAnswerText(it) }, data.text, transcript),
       };
+      if (sendStt) startStt(session, it, data, ans, rec.blob); // 裏で文字にする（届いたら画面を更新）
       if (session.mode === "practice") showReviewOne();
       else nextItem();
     };
@@ -1658,6 +1781,8 @@ function modelHtml(it, data) {
 
 /* ---------- 採点結果の表示 ---------- */
 function scoreCardHtml(ans) {
+  if (ans && ans.sttBusy) return `<div class="score-box none stt-wait"><b>${esc(STT_WAIT)}</b></div>`;
+  if (ans && ans.sttError && !ans.score) return `<div class="score-box none"><b>${esc(ans.sttError)}</b></div>`;
   if (ans && ans.score) {
     const s = ans.score;
     const ok = s.items.filter((i) => i.ok).length;
@@ -1677,6 +1802,9 @@ function scoreCardHtml(ans) {
       </div>`;
   }
   // 文字起こしが取れなかったとき
+  if (ans && ans.sttEmpty) {
+    return `<div class="score-box none"><b>${esc(STT_EMPTY)}</b><small>下の欄に英語を入れて「✅ この英語で自動採点」を押すか、解答例と比べて自己チェックしましょう。</small></div>`;
+  }
   const why = IN_ARTIFACT
     ? (Dict.usable()
       ? "声が文字になりませんでした（音声入力が止まっていた／小さな声 など）。"
@@ -1734,7 +1862,7 @@ function showReviewOne() {
     <div class="card review-card" style="--c:${m.color}">
       <div class="model-title">あなたの解答</div>
       ${ans.url ? `<audio controls src="${ans.url}" class="player"></audio>` : `<p class="muted">（録音なし${IN_ARTIFACT ? "：この開き方では録音できません" : ""}）</p>`}
-      ${ans.transcript ? `<p class="transcript">📝 聞き取った内容：<br>"${esc(ans.transcript)}"</p>` : ""}
+      <div class="tr-area" data-qid="${esc(data.id)}" data-long="1">${transcriptHtml(ans, true)}</div>
       <div class="score-area" data-qid="${esc(data.id)}" data-self="1">${scoreCardHtml(ans)}${selfCheckHtml(it, data, ans)}</div>
       ${aiSlotHtml(data.id)}
       ${modelHtml(it, data)}
@@ -1896,7 +2024,7 @@ function showFinal() {
         ${ans.url ? `
           <audio controls src="${ans.url}" class="player"></audio>
           <a class="dl-link" href="${ans.url}" download="ESATJ_${esc(session.set.title)}_${esc(itemLabel(it)).replace(/[\s.]/g, "")}.${extOf(ans.mime)}">⬇️ 録音を保存</a>` : '<p class="muted">（録音なし）</p>'}
-        ${ans.transcript ? `<p class="transcript">📝 "${esc(ans.transcript)}"</p>` : ""}
+        <div class="tr-area" data-qid="${esc(data.id)}">${transcriptHtml(ans, false)}</div>
         ${aiSlotHtml(data.id)}
         <details class="model-details"><summary>採点の内訳と解答例を見る</summary><div class="score-area" data-qid="${esc(data.id)}">${scoreCardHtml(ans)}</div>${modelHtml(it, data)}</details>
         <div class="self-area" data-qid="${esc(data.id)}">${selfCheckHtml(it, data, ans)}</div>
@@ -1908,6 +2036,7 @@ function showFinal() {
       <span class="ses-chip" style="--c:#0f766e">おつかれさま！</span>
       <span class="ses-progress">${esc(session.set.title)}・${session.mode === "exam" ? "本番モード" : "練習モード"}</span>
     </div>
+    <div id="stt-pending"></div>
     <div id="final-result">${finalResultHtml()}</div>
     <div id="final-table">${finalTableHtml()}</div>
     <div class="ai-slot" data-ai="all"></div>
@@ -1921,6 +2050,7 @@ function showFinal() {
   bindSelfChecks($app(), () => updateFinalGrade());
   fillAnswerSlots();
   updateFinalGrade();
+  refreshAllButton();
 
   $app().querySelector("button[data-act='save']").onclick = () => {
     const r = updateFinalGrade() || { rate: 0, grade: "F", auto: false };

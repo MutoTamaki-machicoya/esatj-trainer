@@ -24,7 +24,7 @@ function extractJsonValue(text) {
 }
 
 // 中継のエラー → アプリのエラーコード（AI.handleError が文言にする）
-const RELAY_CODES = ["bad_passcode", "daily_limit", "student_limit", "too_many_fails", "rate_limited", "prompt_too_large", "refused", "empty_completion"];
+const RELAY_CODES = ["bad_passcode", "daily_limit", "student_limit", "too_many_fails", "rate_limited", "prompt_too_large", "audio_too_large", "refused", "empty_completion"];
 function relayErrorCode(status, body) {
   const c = body && typeof body.code === "string" ? body.code : "";
   if (RELAY_CODES.includes(c)) return c;
@@ -97,6 +97,84 @@ async function relayJson(url, auth, prompt, meta, opts) {
   return extractJsonValue(body.text);
 }
 
+/* ---------- 文字起こし（中継の /stt・Whisper） ----------
+   iPhone/Android では録音とブラウザの音声認識が同時にマイクを使えないため、
+   Web版でログイン済みなら、録音をそのまま中継へ送って文字にしてもらう（録音は文字にしたあと中継に残らない） */
+const STT_MAX_CHARS = 4000000; // 中継の上限（base64 の文字数）
+
+function sttUrl(url) {
+  return String(url || "").replace(/\/$/, "") + "/stt";
+}
+
+// 録音（Blob）→ base64。arrayBuffer が無い古いブラウザは FileReader で
+async function blobToBase64(blob) {
+  if (blob && typeof blob.arrayBuffer === "function") {
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    let bin = "";
+    const CH = 0x8000;
+    for (let i = 0; i < buf.length; i += CH) bin += String.fromCharCode.apply(null, buf.subarray(i, i + CH));
+    return btoa(bin);
+  }
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).replace(/^data:[^,]*,/, ""));
+    fr.onerror = () => reject(fr.error);
+    fr.readAsDataURL(blob);
+  });
+}
+
+// 中継へ1回だけ送る（自動の送り直しなし）。成功なら文字（無音なら ""）、失敗なら {code} で reject
+async function transcribe(o) {
+  o = o || {};
+  const f = o.fetch || (typeof fetch === "function" ? fetch : null);
+  if (!f) throw { code: "upstream_error", message: "fetch is not available" };
+  if (o.signal && o.signal.aborted) throw { code: "cancelled" };
+  if (!o.blob) throw { code: "bad_request", message: "no audio" };
+  let audio;
+  try { audio = await blobToBase64(o.blob); } catch (e) { throw { code: "upstream_error", message: "could not read audio" }; }
+  if (audio.length > STT_MAX_CHARS) throw { code: "audio_too_large" };
+  let res;
+  try {
+    res = await f(sttUrl(o.url), {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=UTF-8" },
+      body: JSON.stringify({ code: normCode(o.code), pass: String(o.pass || ""), audio: audio }),
+      signal: o.signal,
+    });
+  } catch (e) {
+    if ((e && e.name === "AbortError") || (o.signal && o.signal.aborted)) throw { code: "cancelled" };
+    throw { code: "upstream_error", message: String(e && e.message ? e.message : e) };
+  }
+  let body = null;
+  try { body = await res.json(); } catch (e) { body = null; }
+  if (!res.ok) throw { code: relayErrorCode(res.status, body), status: res.status };
+  if (!body || typeof body.text !== "string") throw { code: "upstream_error", message: "no text in stt reply" };
+  return body.text.trim();
+}
+
+// Whisper（中継の文字起こし）を使う条件：Web版（アーティファクトでない）・中継URLあり・ログイン済み・録音できる
+function canUseWhisper(c) {
+  c = c || {};
+  return !c.inArtifact && !!String(c.url || "").trim() && !!c.loggedIn && !!c.recSupported;
+}
+
+// 文字起こしの待ち：まだ届いていない問題の数
+function pendingStt(answers) {
+  return Object.values(answers || {}).filter((a) => a && a.sttBusy).length;
+}
+// 各問の「🤖 Claudeに採点してもらう」：文字起こし中・採点中は押せない
+function oneButtonDisabled(ans) {
+  return !!(ans && (ans.sttBusy || ans.aiBusy));
+}
+// 「🤖 全問まとめて…」：全部の文字起こしが届くまで押せない
+function allButtonState(answers, allBusy) {
+  const n = pendingStt(answers);
+  return { disabled: n > 0 || !!allBusy, pending: n, note: n > 0 ? "文字起こしが終わると押せます" : "" };
+}
+
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { extractJsonValue, relayErrorCode, relayJson, normCode, isLoggedIn, saveLogin, clearLogin, buildMeta };
+  module.exports = {
+    extractJsonValue, relayErrorCode, relayJson, normCode, isLoggedIn, saveLogin, clearLogin, buildMeta,
+    sttUrl, blobToBase64, transcribe, canUseWhisper, pendingStt, oneButtonDisabled, allButtonState, STT_MAX_CHARS,
+  };
 }
