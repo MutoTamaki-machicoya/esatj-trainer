@@ -56,9 +56,79 @@ const History = {
 // iPhone / iPad（マイクを使ったままだと、読み上げや録音の再生が小さくなる・出ないことがある）
 const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
+// 音声ファイルの名前のもと（tools/make_audio.mjs の audioKey と同じ計算。変えるときは両方直す）
+function audioKey(str) {
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+// 読み上げ。Web版は、あらかじめ作った音声ファイル（audio/）を再生する。スマホ（とくに iPhone）では
+// 端末の読み上げ機能が鳴らないことがあるため。ファイルが無い文（Claudeの言い直し例など）と Claude版は端末の読み上げを使う
 const TTS = {
   voice: null,
   _u: null, // 読み上げ中の発話を持っておく（途中で回収されて止まるのを防ぐ）
+  el: null,          // 音声ファイルを鳴らす <audio>（1つを使い回す。iPhone は一度ボタン操作で鳴らした要素だけ、あとから自動で鳴らせる）
+  _unlocked: false,
+  _finishFile: null, // 再生中のファイルを終わらせる関数
+  fileFor(text) {
+    const A = window.ESATJ_AUDIO;
+    if (!A || !A.keys) return null;
+    const k = audioKey(String(text));
+    return A.keys[k] ? A.dir + k + ".m4a" : null;
+  },
+  ensureEl() {
+    if (!this.el) {
+      this.el = new Audio();
+      this.el.preload = "auto";
+      this.el.setAttribute("playsinline", "");
+    }
+    return this.el;
+  },
+  playFile(url, text, { times = 1, gap = 700, onend = null, onstart = null, onerror = null, force = false } = {}) {
+    const el = this.ensureEl();
+    let finished = false;
+    let count = 0;
+    const clear = () => { el.onended = el.onerror = el.onplaying = null; this._finishFile = null; };
+    const words = text.split(/\s+/).length;
+    const guard = setTimeout(() => finish(), times * (2000 + words * 700) + (times - 1) * gap + 3000);
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(guard);
+      clear();
+      if (onend) onend();
+    };
+    // ファイルを鳴らせなかったら、端末の読み上げに切り替える
+    const fallback = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(guard);
+      clear();
+      this.speakSynth(text, { times: times - count, gap, onend, onstart, onerror, force });
+    };
+    const play = () => {
+      if (finished) return;
+      try {
+        el.src = url;
+        el.defaultPlaybackRate = Settings.data.rate || 1;
+        el.playbackRate = Settings.data.rate || 1;
+        const p = el.play();
+        if (p && p.catch) p.catch(fallback);
+      } catch (e) { fallback(); }
+    };
+    el.onplaying = () => { this._unlocked = true; if (onstart) onstart(); };
+    el.onended = () => { count += 1; if (count < times) setTimeout(play, gap); else finish(); };
+    el.onerror = fallback;
+    this._finishFile = finish;
+    play();
+  },
   // 声の一覧から、選んである声を取り直す（スマホでは古い声の指定だと音が出ないことがある）
   freshVoice() {
     if (!this.voice) return null;
@@ -83,8 +153,18 @@ const TTS = {
     this.pick();
     speechSynthesis.onvoiceschanged = () => this.pick();
   },
-  available() { return !!this.voice; },
+  available() { return !!this.voice || !!(window.ESATJ_AUDIO && window.ESATJ_AUDIO.keys); },
   warm() {
+    // iPhone対策: ボタン操作の直後に、短い無音を一度鳴らしておく（あとの問題の音声を自動で鳴らせるようにする）
+    const A = window.ESATJ_AUDIO;
+    if (A && A.unlock && !this._unlocked && !this._finishFile) {
+      try {
+        const el = this.ensureEl();
+        el.src = A.unlock;
+        const p = el.play();
+        if (p && p.then) p.then(() => { this._unlocked = true; }).catch(() => {});
+      } catch (e) {}
+    }
     // iOS対策: ユーザー操作の直後に一度発話しておく
     if (!("speechSynthesis" in window)) return;
     try {
@@ -93,11 +173,20 @@ const TTS = {
       speechSynthesis.speak(u);
     } catch (e) {}
   },
-  stop() { try { speechSynthesis.cancel(); } catch (e) {} },
+  stop() {
+    if (this.el) { try { this.el.pause(); } catch (e) {} }
+    if (this._finishFile) this._finishFile();
+    try { speechSynthesis.cancel(); } catch (e) {}
+  },
   // onend は「全再生が終わったとき」に必ず1回だけ呼ぶ。
   // onendが発火しないブラウザ対策として、文の長さから見積もった上限時間で強制的に先へ進む。
   // force: 英語の声が一覧に無くても、端末の既定の声で読ませてみる（お手本ボタン用）
-  speak(text, { times = 1, gap = 700, onend = null, onstart = null, onerror = null, force = false } = {}) {
+  speak(text, opts = {}) {
+    const file = this.fileFor(text);
+    if (file) { this.stop(); this.playFile(file, text, opts); return; }
+    this.speakSynth(text, opts);
+  },
+  speakSynth(text, { times = 1, gap = 700, onend = null, onstart = null, onerror = null, force = false } = {}) {
     if (!("speechSynthesis" in window)) { if (onerror) onerror("unsupported"); if (onend) onend(); return; }
     if (!this.voice) this.pick(); // 声の一覧があとから届く端末がある
     if (!this.available() && !force) { if (onend) onend(); return; }
@@ -1604,7 +1693,7 @@ const SAY_HELP = "音が出ないときは、音量と消音（マナー）モ�
 function bindSayButtons(root) {
   if (!root) return;
   root.querySelectorAll("button[data-say]").forEach((b) => {
-    if (!("speechSynthesis" in window)) { b.style.display = "none"; return; }
+    if (!("speechSynthesis" in window) && !TTS.fileFor(b.dataset.say)) { b.style.display = "none"; return; }
     const label = b.textContent;
     b.onclick = () => {
       if (b.dataset.playing === "1") { TTS.stop(); b.dataset.playing = ""; b.textContent = label; return; }
