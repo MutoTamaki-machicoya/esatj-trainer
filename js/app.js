@@ -264,7 +264,7 @@ const Rec = {
     if (!this.supported) return false;
     if (this.stream) return true;
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } }).catch(() => navigator.mediaDevices.getUserMedia({ audio: true }));
       return true;
     } catch (e) {
       return false;
@@ -282,10 +282,10 @@ const Rec = {
     try {
       this.chunks = [];
       this.mime = this.pickMime();
-      // 中継へ送る録音を小さくするため 32kbps を指定（指定で失敗する端末は今までどおり）
+      // 中継へ送る録音を小さくするため 64kbps を指定（指定で失敗する端末は今までどおり）
       const opts = this.mime ? { mimeType: this.mime } : {};
       try {
-        this.recorder = new MediaRecorder(this.stream, Object.assign({ audioBitsPerSecond: 32000 }, opts));
+        this.recorder = new MediaRecorder(this.stream, Object.assign({ audioBitsPerSecond: 64000 }, opts));
       } catch (e) {
         this.recorder = this.mime ? new MediaRecorder(this.stream, { mimeType: this.mime }) : new MediaRecorder(this.stream);
       }
@@ -782,7 +782,7 @@ const STT_EMPTY = "声が聞き取れませんでした";
 function startStt(sess, it, data, ans, blob) {
   ans.sttBusy = true;
   ans.sttError = "";
-  transcribe({ url: AI.url, code: Settings.data.gradeCode, pass: Settings.data.gradePass, blob: blob })
+  transcribe({ url: AI.url, code: Settings.data.gradeCode, pass: Settings.data.gradePass, blob: blob, hint: sttHint([data.text, data.q, data.theme, data.opener]) })
     .then((text) => {
       ans.sttBusy = false;
       ans.transcript = text;
@@ -1629,6 +1629,8 @@ function showQuestion() {
       Beep.end();
       SR.stop();
       const secs = Math.min(T.ans, Math.round((performance.now() - t0) / 1000));
+      // 語尾が切れないよう、録音は0.5秒あとで止める（タイマー切れ・「解答を終える」のどちらでも）
+      if (whisper) await new Promise((r) => setTimeout(r, 500));
       const rec = await Rec.stop();
       // 文字起こしの遅れ分待つ（音声入力は確定まで少し長め）
       await new Promise((r) => setTimeout(r, useDict ? 1500 : 400));

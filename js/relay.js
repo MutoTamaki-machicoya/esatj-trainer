@@ -138,7 +138,7 @@ async function transcribe(o) {
     res = await f(sttUrl(o.url), {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=UTF-8" },
-      body: JSON.stringify({ code: normCode(o.code), pass: String(o.pass || ""), audio: audio }),
+      body: JSON.stringify({ code: normCode(o.code), pass: String(o.pass || ""), audio: audio, hint: String(o.hint || "").slice(0, 300) }),
       signal: o.signal,
     });
   } catch (e) {
@@ -150,6 +150,25 @@ async function transcribe(o) {
   if (!res.ok) throw { code: relayErrorCode(res.status, body), status: res.status };
   if (!body || typeof body.text !== "string") throw { code: "upstream_error", message: "no text in stt reply" };
   return body.text.trim();
+}
+
+// 音声認識への手がかり：その問題の文に出てくる固有名詞（Mr. Sato・Osaka など）。生徒の発音があいまいでも綴りが合いやすくなる
+// （原文そのものは渡さない：読み飛ばした部分まで補われて、採点が甘くなるため）
+function sttHint(texts) {
+  const seen = []; const add = (w) => { if (w && seen.indexOf(w) < 0) seen.push(w); };
+  (texts || []).forEach((t) => {
+    const toks = String(t || "").split(/\s+/).filter(Boolean);
+    toks.forEach((tok, i) => {
+      const w = tok.replace(/^[^A-Za-z]+|[^A-Za-z.]+$/g, "");
+      if (/^(Mr|Ms|Mrs)\.$/.test(w)) { add(w); return; }
+      const word = w.replace(/\.$/, "");
+      if (!/^[A-Z][a-z]{2,}$/.test(word)) return;
+      const prev = i > 0 ? toks[i - 1] : "";
+      const sentenceStart = i === 0 || (/[.!?]["')]*$/.test(prev) && !/^(Mr|Ms|Mrs)\.$/.test(prev.replace(/^[^A-Za-z]+/, "")));
+      if (!sentenceStart) add(word);
+    });
+  });
+  return seen.join(", ").slice(0, 250);
 }
 
 // Whisper（中継の文字起こし）を使う条件：Web版（アーティファクトでない）・中継URLあり・ログイン済み・録音できる
@@ -173,7 +192,7 @@ function allButtonState(answers, allBusy) {
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = {
+  module.exports = { sttHint,
     extractJsonValue, relayErrorCode, relayJson, normCode, isLoggedIn, saveLogin, clearLogin, buildMeta,
     sttUrl, blobToBase64, transcribe, canUseWhisper, pendingStt, oneButtonDisabled, allButtonState, STT_MAX_CHARS,
   };
